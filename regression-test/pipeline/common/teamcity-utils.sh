@@ -68,7 +68,7 @@ get_commit_id_of_build() {
             -u OneMoreChance:OneMoreChance \
             -H "Content-Type:text/plain" \
             -H "Accept: application/json" \
-            "http://43.132.222.7:8111/app/rest/builds/${build_id}"
+            "http://172.16.48.8:12870/app/rest/builds/${build_id}"
     ); then
         set +x
         commit_id=$(echo "${ret}" | jq -r '.revisions.revision[0].version')
@@ -96,7 +96,7 @@ get_running_build_of_pr() {
             -u OneMoreChance:OneMoreChance \
             -H "Content-Type:text/plain" \
             -H "Accept: application/json" \
-            "http://43.132.222.7:8111/app/rest/builds?locator=buildType:${PIPELINE},branch:pull/${PULL_REQUEST_NUM},running:true"
+            "http://172.16.48.8:12870/app/rest/builds?locator=buildType:${PIPELINE},branch:pull/${PULL_REQUEST_NUM},running:true"
     ); then
         set +x
         running_builds_list=$(echo "${ret}" | jq -r '.build[].id')
@@ -125,7 +125,7 @@ get_queue_build_of_pr() {
             -u OneMoreChance:OneMoreChance \
             -H "Content-Type:text/plain" \
             -H "Accept: application/json" \
-            "http://43.132.222.7:8111/app/rest/buildQueue?locator=buildType:${PIPELINE}"
+            "http://172.16.48.8:12870/app/rest/buildQueue?locator=buildType:${PIPELINE}"
     ); then
         set +x
         queue_builds_list=$(echo "${ret}" | jq ".build[] | select(.branchName == \"pull/${PULL_REQUEST_NUM}\") | .id")
@@ -153,7 +153,7 @@ cancel_running_build() {
             -u OneMoreChance:OneMoreChance \
             -H "Content-Type:application/json" \
             -H "Accept: application/json" \
-            "http://43.132.222.7:8111/app/rest/builds/id:${id}" \
+            "http://172.16.48.8:12870/app/rest/builds/id:${id}" \
             -d '{ "comment": "Canceling this running build before triggering a new one", "readdIntoQueue": false }'; then
             set +x
             echo -e "\nINFO: canceled running build(id ${id}) for PR ${PULL_REQUEST_NUM} of pipeline ${PIPELINE}"
@@ -181,7 +181,7 @@ cancel_queue_build() {
             -u OneMoreChance:OneMoreChance \
             -H "Content-Type:application/json" \
             -H "Accept: application/json" \
-            "http://43.132.222.7:8111/app/rest/buildQueue/id:${id}" \
+            "http://172.16.48.8:12870/app/rest/buildQueue/id:${id}" \
             -d '{ "comment": "Canceling this queued build before triggering a new one", "readdIntoQueue": false }'; then
             set +x
             echo -e "\nINFO: canceled queue build(id ${id}) for PR ${PULL_REQUEST_NUM} of pipeline ${PIPELINE}"
@@ -241,7 +241,7 @@ trigger_build() {
         -u OneMoreChance:OneMoreChance \
         -H "Content-Type:text/plain" \
         -H "Accept: application/json" \
-        "http://43.132.222.7:8111/httpAuth/action.html?add2Queue=${PIPELINE}&branchName=pull/${PULL_REQUEST_NUM}&name=env.pr_num_from_trigger&value=${PULL_REQUEST_NUM:-}&name=env.commit_id_from_trigger&value=${COMMIT_ID_FROM_TRIGGER:-}&name=env.repeat_times_from_trigger&value=${COMMENT_REPEAT_TIMES:-1}"; then
+        "http://172.16.48.8:12870/httpAuth/action.html?add2Queue=${PIPELINE}&branchName=pull/${PULL_REQUEST_NUM}&name=env.pr_num_from_trigger&value=${PULL_REQUEST_NUM:-}&name=env.commit_id_from_trigger&value=${COMMIT_ID_FROM_TRIGGER:-}&name=env.repeat_times_from_trigger&value=${COMMENT_REPEAT_TIMES:-1}"; then
         set +x
         echo "INFO: Add new build to PIPELINE ${PIPELINE} of PR ${PULL_REQUEST_NUM} with COMMENT_REPEAT_TIMES ${COMMENT_REPEAT_TIMES:-1}"
     else
