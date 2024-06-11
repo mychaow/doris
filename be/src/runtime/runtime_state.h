@@ -42,6 +42,7 @@
 #include "runtime/task_execution_context.h"
 #include "util/debug_util.h"
 #include "util/runtime_profile.h"
+#include "vec/columns/columns_number.h"
 
 namespace doris {
 class IRuntimeFilter;
@@ -50,6 +51,7 @@ namespace pipeline {
 class PipelineXLocalStateBase;
 class PipelineXSinkLocalStateBase;
 class PipelineXFragmentContext;
+class PipelineXTask;
 } // namespace pipeline
 
 class DescriptorTbl;
@@ -65,13 +67,10 @@ class RuntimeState {
     ENABLE_FACTORY_CREATOR(RuntimeState);
 
 public:
-    // for ut only
-    RuntimeState(const TUniqueId& fragment_instance_id, const TQueryOptions& query_options,
-                 const TQueryGlobals& query_globals, ExecEnv* exec_env);
-
     RuntimeState(const TPlanFragmentExecParams& fragment_exec_params,
                  const TQueryOptions& query_options, const TQueryGlobals& query_globals,
-                 ExecEnv* exec_env, QueryContext* ctx);
+                 ExecEnv* exec_env, QueryContext* ctx,
+                 const std::shared_ptr<MemTrackerLimiter>& query_mem_tracker = nullptr);
 
     RuntimeState(const TUniqueId& instance_id, const TUniqueId& query_id, int32 fragment_id,
                  const TQueryOptions& query_options, const TQueryGlobals& query_globals,
@@ -101,7 +100,9 @@ public:
 
     // for ut and non-query.
     void set_exec_env(ExecEnv* exec_env) { _exec_env = exec_env; }
-    void init_mem_trackers(const TUniqueId& id = TUniqueId(), const std::string& name = "unknown");
+
+    // for ut and non-query.
+    void init_mem_trackers(const std::string& name = "ut", const TUniqueId& id = TUniqueId());
 
     const TQueryOptions& query_options() const { return _query_options; }
     int64_t scan_queue_mem_limit() const {
@@ -178,10 +179,10 @@ public:
                _query_options.enable_common_expr_pushdown;
     }
 
-    bool enable_faster_float_convert() const {
-        return _query_options.__isset.faster_float_convert && _query_options.faster_float_convert;
+    bool mysql_row_binary_format() const {
+        return _query_options.__isset.mysql_row_binary_format &&
+               _query_options.mysql_row_binary_format;
     }
-
     Status query_status();
 
     // Appends error to the _error_log if there is space
@@ -430,6 +431,11 @@ public:
         return _query_options.__isset.skip_missing_version && _query_options.skip_missing_version;
     }
 
+    int64_t data_queue_max_blocks() const {
+        return _query_options.__isset.data_queue_max_blocks ? _query_options.data_queue_max_blocks
+                                                            : 1;
+    }
+
     bool enable_page_cache() const;
 
     int partitioned_hash_join_rows_threshold() const {
@@ -453,6 +459,8 @@ public:
     std::vector<TTabletCommitInfo>& tablet_commit_infos() { return _tablet_commit_infos; }
 
     std::vector<THivePartitionUpdate>& hive_partition_updates() { return _hive_partition_updates; }
+
+    std::vector<TIcebergCommitData>& iceberg_commit_datas() { return _iceberg_commit_datas; }
 
     const std::vector<TErrorTabletInfo>& error_tablet_infos() const { return _error_tablet_infos; }
 
@@ -593,15 +601,22 @@ public:
     bool is_nereids() const;
 
     bool enable_join_spill() const {
-        return _query_options.__isset.enable_join_spill && _query_options.enable_join_spill;
+        return (_query_options.__isset.enable_force_spill && _query_options.enable_force_spill) ||
+               (_query_options.__isset.enable_join_spill && _query_options.enable_join_spill);
     }
 
     bool enable_sort_spill() const {
-        return _query_options.__isset.enable_sort_spill && _query_options.enable_sort_spill;
+        return (_query_options.__isset.enable_force_spill && _query_options.enable_force_spill) ||
+               (_query_options.__isset.enable_sort_spill && _query_options.enable_sort_spill);
     }
 
     bool enable_agg_spill() const {
-        return _query_options.__isset.enable_agg_spill && _query_options.enable_agg_spill;
+        return (_query_options.__isset.enable_force_spill && _query_options.enable_force_spill) ||
+               (_query_options.__isset.enable_agg_spill && _query_options.enable_agg_spill);
+    }
+
+    bool enable_force_spill() const {
+        return _query_options.__isset.enable_force_spill && _query_options.enable_force_spill;
     }
 
     int64_t min_revocable_mem() const {
@@ -619,12 +634,20 @@ public:
 
     int task_id() const { return _task_id; }
 
+    void set_task_num(int task_num) { _task_num = task_num; }
+
+    int task_num() const { return _task_num; }
+
+    vectorized::ColumnInt64* partial_update_auto_inc_column() {
+        return _partial_update_auto_inc_column;
+    };
+
 private:
     Status create_error_log_file();
 
     static const int DEFAULT_BATCH_SIZE = 4062;
 
-    std::shared_ptr<MemTrackerLimiter> _query_mem_tracker;
+    std::shared_ptr<MemTrackerLimiter> _query_mem_tracker = nullptr;
 
     // Could not find a better way to record if the weak ptr is inited, use a bool to record
     // it. In some unit test cases, the runtime state's task ctx is not inited, then the test
@@ -729,8 +752,11 @@ private:
     std::vector<TErrorTabletInfo> _error_tablet_infos;
     int _max_operator_id = 0;
     int _task_id = -1;
+    int _task_num = 0;
 
     std::vector<THivePartitionUpdate> _hive_partition_updates;
+
+    std::vector<TIcebergCommitData> _iceberg_commit_datas;
 
     std::vector<std::unique_ptr<doris::pipeline::PipelineXLocalStateBase>> _op_id_to_local_state;
 
@@ -745,6 +771,8 @@ private:
 
     // prohibit copies
     RuntimeState(const RuntimeState&);
+
+    vectorized::ColumnInt64* _partial_update_auto_inc_column;
 };
 
 #define RETURN_IF_CANCELLED(state)                                                    \

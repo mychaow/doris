@@ -89,7 +89,7 @@ public:
     std::string get_name() const override { return "Nullable(" + nested_column->get_name() + ")"; }
     MutableColumnPtr clone_resized(size_t size) const override;
     size_t size() const override { return assert_cast<const ColumnUInt8&>(*null_map).size(); }
-    bool is_null_at(size_t n) const override {
+    PURE bool is_null_at(size_t n) const override {
         return assert_cast<const ColumnUInt8&>(*null_map).get_data()[n] != 0;
     }
     bool is_default_at(size_t n) const override { return is_null_at(n); }
@@ -121,6 +121,10 @@ public:
     void deserialize_vec(std::vector<StringRef>& keys, size_t num_rows) override;
 
     void insert_range_from(const IColumn& src, size_t start, size_t length) override;
+
+    void insert_range_from_ignore_overflow(const IColumn& src, size_t start,
+                                           size_t length) override;
+
     void insert_indices_from(const IColumn& src, const uint32_t* indices_begin,
                              const uint32_t* indices_end) override;
     void insert_indices_from_not_has_null(const IColumn& src, const uint32_t* indices_begin,
@@ -208,6 +212,10 @@ public:
     ColumnPtr permute(const Permutation& perm, size_t limit) const override;
     //    ColumnPtr index(const IColumn & indexes, size_t limit) const override;
     int compare_at(size_t n, size_t m, const IColumn& rhs_, int null_direction_hint) const override;
+
+    void compare_internal(size_t rhs_row_id, const IColumn& rhs, int nan_direction_hint,
+                          int direction, std::vector<uint8>& cmp_res,
+                          uint8* __restrict filter) const override;
     void get_permutation(bool reverse, size_t limit, int null_direction_hint,
                          Permutation& res) const override;
     void reserve(size_t n) override;
@@ -227,16 +235,20 @@ public:
     void update_hashes_with_value(uint64_t* __restrict hashes,
                                   const uint8_t* __restrict null_data) const override;
 
-    MutableColumns scatter(ColumnIndex num_columns, const Selector& selector) const override {
-        return scatter_impl<ColumnNullable>(num_columns, selector);
-    }
-
     void append_data_by_selector(MutableColumnPtr& res,
                                  const IColumn::Selector& selector) const override {
         append_data_by_selector_impl<ColumnNullable>(res, selector);
     }
 
-    //    void gather(ColumnGathererStream & gatherer_stream) override;
+    void append_data_by_selector(MutableColumnPtr& res, const IColumn::Selector& selector,
+                                 size_t begin, size_t end) const override {
+        append_data_by_selector_impl<ColumnNullable>(res, selector, begin, end);
+    }
+
+    ColumnPtr convert_column_if_overflow() override {
+        nested_column = nested_column->convert_column_if_overflow();
+        return get_ptr();
+    }
 
     void for_each_subcolumn(ColumnCallback callback) override {
         callback(nested_column);
@@ -348,6 +360,7 @@ public:
 
     void replace_column_data_default(size_t self_row = 0) override {
         LOG(FATAL) << "should not call the method in column nullable";
+        __builtin_unreachable();
     }
 
     MutableColumnPtr convert_to_predicate_column_if_dictionary() override {

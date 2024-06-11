@@ -94,7 +94,6 @@ import org.apache.doris.clone.TabletChecker;
 import org.apache.doris.clone.TabletScheduler;
 import org.apache.doris.clone.TabletSchedulerStat;
 import org.apache.doris.common.AnalysisException;
-import org.apache.doris.common.ClientPool;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.ConfigBase;
 import org.apache.doris.common.ConfigException;
@@ -104,7 +103,9 @@ import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.FeMetaVersion;
+import org.apache.doris.common.LogUtils;
 import org.apache.doris.common.MetaNotFoundException;
+import org.apache.doris.common.NereidsSqlCacheManager;
 import org.apache.doris.common.Pair;
 import org.apache.doris.common.ThreadPoolManager;
 import org.apache.doris.common.UserException;
@@ -132,6 +133,7 @@ import org.apache.doris.datasource.CatalogMgr;
 import org.apache.doris.datasource.ExternalMetaCacheMgr;
 import org.apache.doris.datasource.ExternalMetaIdMgr;
 import org.apache.doris.datasource.InternalCatalog;
+import org.apache.doris.datasource.SplitSourceManager;
 import org.apache.doris.datasource.es.EsExternalCatalog;
 import org.apache.doris.datasource.es.EsRepository;
 import org.apache.doris.datasource.hive.HiveTransactionMgr;
@@ -140,6 +142,8 @@ import org.apache.doris.deploy.DeployManager;
 import org.apache.doris.deploy.impl.AmbariDeployManager;
 import org.apache.doris.deploy.impl.K8sDeployManager;
 import org.apache.doris.deploy.impl.LocalFileDeployManager;
+import org.apache.doris.event.EventProcessor;
+import org.apache.doris.event.ReplacePartitionEvent;
 import org.apache.doris.ha.BDBHA;
 import org.apache.doris.ha.FrontendNodeType;
 import org.apache.doris.ha.HAProtocol;
@@ -182,6 +186,8 @@ import org.apache.doris.mtmv.MTMVRefreshPartitionSnapshot;
 import org.apache.doris.mtmv.MTMVRelation;
 import org.apache.doris.mtmv.MTMVService;
 import org.apache.doris.mtmv.MTMVStatus;
+import org.apache.doris.mysql.authenticate.AuthenticateType;
+import org.apache.doris.mysql.authenticate.AuthenticatorManager;
 import org.apache.doris.mysql.privilege.AccessControllerManager;
 import org.apache.doris.mysql.privilege.Auth;
 import org.apache.doris.mysql.privilege.PrivPredicate;
@@ -253,11 +259,11 @@ import org.apache.doris.system.SystemInfoService;
 import org.apache.doris.system.SystemInfoService.HostInfo;
 import org.apache.doris.task.AgentBatchTask;
 import org.apache.doris.task.AgentTaskExecutor;
+import org.apache.doris.task.CleanTrashTask;
 import org.apache.doris.task.CompactionTask;
 import org.apache.doris.task.DropReplicaTask;
 import org.apache.doris.task.MasterTaskExecutor;
 import org.apache.doris.task.PriorityMasterTaskExecutor;
-import org.apache.doris.thrift.BackendService;
 import org.apache.doris.thrift.TCompressionType;
 import org.apache.doris.thrift.TFrontendInfo;
 import org.apache.doris.thrift.TGetMetaDBMeta;
@@ -453,6 +459,8 @@ public class Env {
     private Auth auth;
     private AccessControllerManager accessManager;
 
+    private AuthenticatorManager authenticatorManager;
+
     private DomainResolver domainResolver;
 
     private TabletSchedulerStat stat;
@@ -524,10 +532,15 @@ public class Env {
     private TopicPublisherThread topicPublisherThread;
 
     private MTMVService mtmvService;
+    private EventProcessor eventProcessor;
 
     private InsertOverwriteManager insertOverwriteManager;
 
     private DNSCache dnsCache;
+
+    private final NereidsSqlCacheManager sqlCacheManager;
+
+    private final SplitSourceManager splitSourceManager;
 
     public List<TFrontendInfo> getFrontendInfos() {
         List<TFrontendInfo> res = new ArrayList<>();
@@ -698,6 +711,7 @@ public class Env {
 
         this.auth = new Auth();
         this.accessManager = new AccessControllerManager(auth);
+        this.authenticatorManager = new AuthenticatorManager(AuthenticateType.getAuthTypeConfig());
         this.domainResolver = new DomainResolver(auth);
 
         this.metaContext = new MetaContext();
@@ -762,8 +776,11 @@ public class Env {
         this.topicPublisherThread = new TopicPublisherThread(
                 "TopicPublisher", Config.publish_topic_info_interval_ms, systemInfo);
         this.mtmvService = new MTMVService();
+        this.eventProcessor = new EventProcessor(mtmvService);
         this.insertOverwriteManager = new InsertOverwriteManager();
         this.dnsCache = new DNSCache();
+        this.sqlCacheManager = new NereidsSqlCacheManager();
+        this.splitSourceManager = new SplitSourceManager();
     }
 
     public static void destroyCheckpoint() {
@@ -819,8 +836,16 @@ public class Env {
         return accessManager;
     }
 
+    public AuthenticatorManager getAuthenticatorManager() {
+        return authenticatorManager;
+    }
+
     public MTMVService getMtmvService() {
         return mtmvService;
+    }
+
+    public EventProcessor getEventProcessor() {
+        return eventProcessor;
     }
 
     public InsertOverwriteManager getInsertOverwriteManager() {
@@ -1036,16 +1061,6 @@ public class Env {
         }
 
         queryCancelWorker.start();
-
-        TopicPublisher wgPublisher = new WorkloadGroupPublisher(this);
-        topicPublisherThread.addToTopicPublisherList(wgPublisher);
-        WorkloadSchedPolicyPublisher wpPublisher = new WorkloadSchedPolicyPublisher(this);
-        topicPublisherThread.addToTopicPublisherList(wpPublisher);
-        topicPublisherThread.start();
-
-        workloadGroupMgr.startUpdateThread();
-        workloadSchedPolicyMgr.start();
-        workloadRuntimeStatusMgr.start();
     }
 
     // wait until FE is ready.
@@ -1438,133 +1453,147 @@ public class Env {
 
     @SuppressWarnings({"checkstyle:WhitespaceAfter", "checkstyle:LineLength"})
     private void transferToMaster() {
-        // stop replayer
-        if (replayer != null) {
-            replayer.exit();
-            try {
-                replayer.join();
-            } catch (InterruptedException e) {
-                LOG.warn("got exception when stopping the replayer thread", e);
+        try {
+            // stop replayer
+            if (replayer != null) {
+                replayer.exit();
+                try {
+                    replayer.join();
+                } catch (InterruptedException e) {
+                    LOG.warn("got exception when stopping the replayer thread", e);
+                }
+                replayer = null;
             }
-            replayer = null;
-        }
 
-        // set this after replay thread stopped. to avoid replay thread modify them.
-        isReady.set(false);
-        canRead.set(false);
+            // set this after replay thread stopped. to avoid replay thread modify them.
+            isReady.set(false);
+            canRead.set(false);
 
-        toMasterProgress = "open editlog";
-        editLog.open();
+            toMasterProgress = "open editlog";
+            editLog.open();
 
-        if (Config.edit_log_type.equalsIgnoreCase("bdb")) {
-            if (!haProtocol.fencing()) {
-                LOG.error("fencing failed. will exit.");
-                System.exit(-1);
+            if (Config.edit_log_type.equalsIgnoreCase("bdb")) {
+                if (!haProtocol.fencing()) {
+                    LOG.error("fencing failed. will exit.");
+                    System.exit(-1);
+                }
             }
-        }
 
-        toMasterProgress = "replay journal";
-        long replayStartTime = System.currentTimeMillis();
-        // replay journals. -1 means replay all the journals larger than current journal id.
-        replayJournal(-1);
-        long replayEndTime = System.currentTimeMillis();
-        LOG.info("finish replay in " + (replayEndTime - replayStartTime) + " msec");
+            toMasterProgress = "replay journal";
+            long replayStartTime = System.currentTimeMillis();
+            // replay journals. -1 means replay all the journals larger than current journal id.
+            replayJournal(-1);
+            long replayEndTime = System.currentTimeMillis();
+            LOG.info("finish replay in " + (replayEndTime - replayStartTime) + " msec");
 
-        checkCurrentNodeExist();
+            checkCurrentNodeExist();
 
-        checkBeExecVersion();
+            checkBeExecVersion();
 
-        toMasterProgress = "roll editlog";
-        editLog.rollEditLog();
+            toMasterProgress = "roll editlog";
+            editLog.rollEditLog();
 
-        // Log meta_version
-        long journalVersion = MetaContext.get().getMetaVersion();
-        if (journalVersion < FeConstants.meta_version) {
-            toMasterProgress = "log meta version";
-            editLog.logMetaVersion(FeConstants.meta_version);
-            MetaContext.get().setMetaVersion(FeConstants.meta_version);
-        }
-
-        // Log the first frontend
-        if (isFirstTimeStartUp) {
-            // if isFirstTimeStartUp is true, frontends must contains this Node.
-            Frontend self = frontends.get(nodeName);
-            Preconditions.checkNotNull(self);
-            // OP_ADD_FIRST_FRONTEND is emitted, so it can write to BDBJE even if canWrite is false
-            editLog.logAddFirstFrontend(self);
-
-            initLowerCaseTableNames();
-            // Set initial root password if master FE first time launch.
-            auth.setInitialRootPassword(Config.initial_root_password);
-        } else {
-            if (journalVersion <= FeMetaVersion.VERSION_114) {
-                // if journal version is less than 114, which means it is upgraded from version before 2.0.
-                // When upgrading from 1.2 to 2.0, we need to make sure that the parallelism of query remain unchanged
-                // when switch to pipeline engine, otherwise it may impact the load of entire cluster
-                // because the default parallelism of pipeline engine is higher than previous version.
-                // so set parallel_pipeline_task_num to parallel_fragment_exec_instance_num
-                int newVal = VariableMgr.newSessionVariable().parallelExecInstanceNum;
-                VariableMgr.refreshDefaultSessionVariables("1.x to 2.x", SessionVariable.PARALLEL_PIPELINE_TASK_NUM,
-                        String.valueOf(newVal));
-
-                // similar reason as above, need to upgrade broadcast scale factor during 1.2 to 2.x
-                // if the default value has been upgraded
-                double newBcFactorVal = VariableMgr.newSessionVariable().getBroadcastRightTableScaleFactor();
-                VariableMgr.refreshDefaultSessionVariables("1.x to 2.x",
-                        SessionVariable.BROADCAST_RIGHT_TABLE_SCALE_FACTOR,
-                        String.valueOf(newBcFactorVal));
-
-                // similar reason as above, need to upgrade enable_nereids_planner to true
-                VariableMgr.refreshDefaultSessionVariables("1.x to 2.x", SessionVariable.ENABLE_NEREIDS_PLANNER,
-                        "true");
+            // Log meta_version
+            long journalVersion = MetaContext.get().getMetaVersion();
+            if (journalVersion < FeConstants.meta_version) {
+                toMasterProgress = "log meta version";
+                editLog.logMetaVersion(FeConstants.meta_version);
+                MetaContext.get().setMetaVersion(FeConstants.meta_version);
             }
-            if (journalVersion <= FeMetaVersion.VERSION_123) {
-                VariableMgr.refreshDefaultSessionVariables("2.0 to 2.1", SessionVariable.ENABLE_NEREIDS_DML, "true");
-                VariableMgr.refreshDefaultSessionVariables("2.0 to 2.1",
-                        SessionVariable.FRAGMENT_TRANSMISSION_COMPRESSION_CODEC, "none");
+
+            // Log the first frontend
+            if (isFirstTimeStartUp) {
+                // if isFirstTimeStartUp is true, frontends must contains this Node.
+                Frontend self = frontends.get(nodeName);
+                Preconditions.checkNotNull(self);
+                // OP_ADD_FIRST_FRONTEND is emitted, so it can write to BDBJE even if canWrite is false
+                editLog.logAddFirstFrontend(self);
+
+                initLowerCaseTableNames();
+                // Set initial root password if master FE first time launch.
+                auth.setInitialRootPassword(Config.initial_root_password);
+            } else {
+                if (journalVersion <= FeMetaVersion.VERSION_114) {
+                    // if journal version is less than 114, which means it is upgraded from version before 2.0.
+                    // When upgrading from 1.2 to 2.0,
+                    // we need to make sure that the parallelism of query remain unchanged
+                    // when switch to pipeline engine, otherwise it may impact the load of entire cluster
+                    // because the default parallelism of pipeline engine is higher than previous version.
+                    // so set parallel_pipeline_task_num to parallel_fragment_exec_instance_num
+                    int newVal = VariableMgr.newSessionVariable().parallelExecInstanceNum;
+                    VariableMgr.refreshDefaultSessionVariables("1.x to 2.x",
+                            SessionVariable.PARALLEL_PIPELINE_TASK_NUM,
+                            String.valueOf(newVal));
+
+                    // similar reason as above, need to upgrade broadcast scale factor during 1.2 to 2.x
+                    // if the default value has been upgraded
+                    double newBcFactorVal = VariableMgr.newSessionVariable().getBroadcastRightTableScaleFactor();
+                    VariableMgr.refreshDefaultSessionVariables("1.x to 2.x",
+                            SessionVariable.BROADCAST_RIGHT_TABLE_SCALE_FACTOR,
+                            String.valueOf(newBcFactorVal));
+
+                    // similar reason as above, need to upgrade enable_nereids_planner to true
+                    VariableMgr.refreshDefaultSessionVariables("1.x to 2.x", SessionVariable.ENABLE_NEREIDS_PLANNER,
+                            "true");
+                }
+                if (journalVersion <= FeMetaVersion.VERSION_123) {
+                    VariableMgr.refreshDefaultSessionVariables("2.0 to 2.1", SessionVariable.ENABLE_NEREIDS_DML,
+                            "true");
+                    VariableMgr.refreshDefaultSessionVariables("2.0 to 2.1",
+                            SessionVariable.FRAGMENT_TRANSMISSION_COMPRESSION_CODEC, "none");
+                    if (VariableMgr.newSessionVariable().nereidsTimeoutSecond == 5) {
+                        VariableMgr.refreshDefaultSessionVariables("2.0 to 2.1",
+                                SessionVariable.NEREIDS_TIMEOUT_SECOND, "30");
+                    }
+                }
             }
-        }
 
-        getPolicyMgr().createDefaultStoragePolicy();
+            getPolicyMgr().createDefaultStoragePolicy();
 
-        // MUST set master ip before starting checkpoint thread.
-        // because checkpoint thread need this info to select non-master FE to push image
+            // MUST set master ip before starting checkpoint thread.
+            // because checkpoint thread need this info to select non-master FE to push image
 
-        toMasterProgress = "log master info";
-        this.masterInfo = new MasterInfo(Env.getCurrentEnv().getSelfNode().getHost(),
-                Config.http_port,
-                Config.rpc_port);
-        editLog.logMasterInfo(masterInfo);
-        LOG.info("logMasterInfo:{}", masterInfo);
+            toMasterProgress = "log master info";
+            this.masterInfo = new MasterInfo(Env.getCurrentEnv().getSelfNode().getHost(),
+                    Config.http_port,
+                    Config.rpc_port);
+            editLog.logMasterInfo(masterInfo);
+            LOG.info("logMasterInfo:{}", masterInfo);
 
-        // for master, the 'isReady' is set behind.
-        // but we are sure that all metadata is replayed if we get here.
-        // so no need to check 'isReady' flag in this method
-        postProcessAfterMetadataReplayed(false);
+            // for master, the 'isReady' is set behind.
+            // but we are sure that all metadata is replayed if we get here.
+            // so no need to check 'isReady' flag in this method
+            postProcessAfterMetadataReplayed(false);
 
-        insertOverwriteManager.allTaskFail();
+            insertOverwriteManager.allTaskFail();
 
-        toMasterProgress = "start daemon threads";
+            toMasterProgress = "start daemon threads";
 
-        // start all daemon threads that only running on MASTER FE
-        startMasterOnlyDaemonThreads();
-        // start other daemon threads that should running on all FE
-        startNonMasterDaemonThreads();
+            // start all daemon threads that only running on MASTER FE
+            startMasterOnlyDaemonThreads();
+            // start other daemon threads that should running on all FE
+            startNonMasterDaemonThreads();
 
-        MetricRepo.init();
+            MetricRepo.init();
 
-        toMasterProgress = "finished";
-        canRead.set(true);
-        isReady.set(true);
-        checkLowerCaseTableNames();
+            toMasterProgress = "finished";
+            canRead.set(true);
+            isReady.set(true);
+            checkLowerCaseTableNames();
 
-        String msg = "master finished to replay journal, can write now.";
-        Util.stdoutWithTime(msg);
-        LOG.info(msg);
-        // for master, there are some new thread pools need to register metric
-        ThreadPoolManager.registerAllThreadPoolMetric();
-        if (analysisManager != null) {
-            analysisManager.getStatisticsCache().preHeat();
+            String msg = "master finished to replay journal, can write now.";
+            LogUtils.stdout(msg);
+            LOG.info(msg);
+            // for master, there are some new thread pools need to register metric
+            ThreadPoolManager.registerAllThreadPoolMetric();
+            if (analysisManager != null) {
+                analysisManager.getStatisticsCache().preHeat();
+            }
+        } catch (Throwable e) {
+            // When failed to transfer to master, we need to exit the process.
+            // Otherwise, the process will be in an unknown state.
+            LOG.error("failed to transfer to master. progress: {}", toMasterProgress, e);
+            System.exit(-1);
         }
     }
 
@@ -1675,6 +1704,13 @@ public class Env {
         binlogGcer.start();
         columnIdFlusher.start();
         insertOverwriteManager.start();
+
+        TopicPublisher wgPublisher = new WorkloadGroupPublisher(this);
+        topicPublisherThread.addToTopicPublisherList(wgPublisher);
+        WorkloadSchedPolicyPublisher wpPublisher = new WorkloadSchedPolicyPublisher(this);
+        topicPublisherThread.addToTopicPublisherList(wpPublisher);
+        topicPublisherThread.start();
+
     }
 
     // start threads that should running on all FE
@@ -1695,41 +1731,53 @@ public class Env {
         }
 
         dnsCache.start();
+
+        workloadGroupMgr.start();
+        workloadSchedPolicyMgr.start();
+        workloadRuntimeStatusMgr.start();
+        splitSourceManager.start();
     }
 
     private void transferToNonMaster(FrontendNodeType newType) {
         isReady.set(false);
 
-        if (feType == FrontendNodeType.OBSERVER || feType == FrontendNodeType.FOLLOWER) {
-            Preconditions.checkState(newType == FrontendNodeType.UNKNOWN);
-            LOG.warn("{} to UNKNOWN, still offer read service", feType.name());
-            // not set canRead here, leave canRead as what is was.
-            // if meta out of date, canRead will be set to false in replayer thread.
-            metaReplayState.setTransferToUnknown();
-            return;
-        }
+        try {
+            if (feType == FrontendNodeType.OBSERVER || feType == FrontendNodeType.FOLLOWER) {
+                Preconditions.checkState(newType == FrontendNodeType.UNKNOWN);
+                LOG.warn("{} to UNKNOWN, still offer read service", feType.name());
+                // not set canRead here, leave canRead as what is was.
+                // if meta out of date, canRead will be set to false in replayer thread.
+                metaReplayState.setTransferToUnknown();
+                return;
+            }
 
-        // transfer from INIT/UNKNOWN to OBSERVER/FOLLOWER
+            // transfer from INIT/UNKNOWN to OBSERVER/FOLLOWER
 
-        if (replayer == null) {
-            createReplayer();
-            replayer.start();
-        }
+            if (replayer == null) {
+                createReplayer();
+                replayer.start();
+            }
 
-        // 'isReady' will be set to true in 'setCanRead()' method
-        if (!postProcessAfterMetadataReplayed(true)) {
-            // the state has changed, exit early.
-            return;
-        }
+            // 'isReady' will be set to true in 'setCanRead()' method
+            if (!postProcessAfterMetadataReplayed(true)) {
+                // the state has changed, exit early.
+                return;
+            }
 
-        checkLowerCaseTableNames();
+            checkLowerCaseTableNames();
 
-        startNonMasterDaemonThreads();
+            startNonMasterDaemonThreads();
 
-        MetricRepo.init();
+            MetricRepo.init();
 
-        if (analysisManager != null) {
-            analysisManager.getStatisticsCache().preHeat();
+            if (analysisManager != null) {
+                analysisManager.getStatisticsCache().preHeat();
+            }
+        } catch (Throwable e) {
+            // When failed to transfer to non-master, we need to exit the process.
+            // Otherwise, the process will be in an unknown state.
+            LOG.error("failed to transfer to non-master.", e);
+            System.exit(-1);
         }
     }
 
@@ -2608,7 +2656,7 @@ public class Env {
         try {
             String msg = "notify new FE type transfer: " + newType;
             LOG.warn(msg);
-            Util.stdoutWithTime(msg);
+            LogUtils.stdout(msg);
             this.typeTransferQueue.put(newType);
         } catch (InterruptedException e) {
             LOG.error("failed to put new FE type: {}", newType, e);
@@ -2626,7 +2674,7 @@ public class Env {
                         newType = typeTransferQueue.take();
                     } catch (InterruptedException e) {
                         LOG.error("got exception when take FE type from queue", e);
-                        Util.stdoutWithTime("got exception when take FE type from queue. " + e.getMessage());
+                        LogUtils.stdout("got exception when take FE type from queue. " + e.getMessage());
                         System.exit(-1);
                     }
                     Preconditions.checkNotNull(newType);
@@ -2708,7 +2756,7 @@ public class Env {
                             // exit if master changed to any other type
                             String msg = "transfer FE type from MASTER to " + newType.name() + ". exit";
                             LOG.error(msg);
-                            Util.stdoutWithTime(msg);
+                            LogUtils.stdout(msg);
                             System.exit(-1);
                             break;
                         }
@@ -2967,7 +3015,13 @@ public class Env {
 
     // The interface which DdlExecutor needs.
     public void createDb(CreateDbStmt stmt) throws DdlException {
-        getCurrentCatalog().createDb(stmt);
+        CatalogIf<?> catalogIf;
+        if (StringUtils.isEmpty(stmt.getCtlName())) {
+            catalogIf = getCurrentCatalog();
+        } else {
+            catalogIf = catalogMgr.getCatalog(stmt.getCtlName());
+        }
+        catalogIf.createDb(stmt);
     }
 
     // For replay edit log, need't lock metadata
@@ -2980,7 +3034,13 @@ public class Env {
     }
 
     public void dropDb(DropDbStmt stmt) throws DdlException {
-        getCurrentCatalog().dropDb(stmt);
+        CatalogIf<?> catalogIf;
+        if (StringUtils.isEmpty(stmt.getCtlName())) {
+            catalogIf = getCurrentCatalog();
+        } else {
+            catalogIf = catalogMgr.getCatalog(stmt.getCtlName());
+        }
+        catalogIf.dropDb(stmt);
     }
 
     public void replayDropDb(String dbName, boolean isForceDrop, Long recycleTime) throws DdlException {
@@ -3050,11 +3110,13 @@ public class Env {
      * 9. create tablet in BE
      * 10. add this table to FE's meta
      * 11. add this table to ColocateGroup if necessary
+     * @return if CreateTableStmt.isIfNotExists is true, return true if table already exists
+     * otherwise return false
      */
-    public void createTable(CreateTableStmt stmt) throws UserException {
+    public boolean createTable(CreateTableStmt stmt) throws UserException {
         CatalogIf<?> catalogIf = catalogMgr.getCatalogOrException(stmt.getCatalogName(),
                 catalog -> new DdlException(("Unknown catalog " + catalog)));
-        catalogIf.createTable(stmt);
+        return catalogIf.createTable(stmt);
     }
 
     public void createTableLike(CreateTableLikeStmt stmt) throws DdlException {
@@ -4157,9 +4219,15 @@ public class Env {
                                                 boolean isKeysRequired) throws DdlException {
         List<Column> indexColumns = new ArrayList<Column>();
         Map<Integer, Column> clusterColumns = new TreeMap<>();
+        boolean hasValueColumn = false;
         for (Column column : columns) {
             if (column.isKey()) {
+                if (hasValueColumn && isKeysRequired) {
+                    throw new DdlException("The materialized view not support value column before key column");
+                }
                 indexColumns.add(column);
+            } else {
+                hasValueColumn = true;
             }
             if (column.isClusterKey()) {
                 clusterColumns.put(column.getClusterKeyId(), column);
@@ -5044,7 +5112,7 @@ public class Env {
 
     // Switch catalog of this sesseion.
     public void changeCatalog(ConnectContext ctx, String catalogName) throws DdlException {
-        CatalogIf catalogIf = catalogMgr.getCatalogNullable(catalogName);
+        CatalogIf catalogIf = catalogMgr.getCatalog(catalogName);
         if (catalogIf == null) {
             throw new DdlException(ErrorCode.ERR_UNKNOWN_CATALOG.formatErrorMsg(catalogName),
                     ErrorCode.ERR_UNKNOWN_CATALOG);
@@ -5488,6 +5556,18 @@ public class Env {
         long version = olapTable.getNextVersion();
         long versionTime = System.currentTimeMillis();
         olapTable.updateVisibleVersionAndTime(version, versionTime);
+        // Here, we only wait for the EventProcessor to finish processing the event,
+        // but regardless of the success or failure of the result,
+        // it does not affect the logic of replace the partition
+        try {
+            Env.getCurrentEnv().getEventProcessor().processEvent(
+                    new ReplacePartitionEvent(db.getCatalog().getId(), db.getId(),
+                            olapTable.getId()));
+        } catch (Throwable t) {
+            // According to normal logic, no exceptions will be thrown,
+            // but in order to avoid bugs affecting the original logic, all exceptions are caught
+            LOG.warn("produceEvent failed: ", t);
+        }
         // write log
         ReplacePartitionOperationLog info =
                 new ReplacePartitionOperationLog(db.getId(), db.getFullName(), olapTable.getId(), olapTable.getName(),
@@ -5775,25 +5855,13 @@ public class Env {
 
     public void cleanTrash(AdminCleanTrashStmt stmt) {
         List<Backend> backends = stmt.getBackends();
+        AgentBatchTask batchTask = new AgentBatchTask();
         for (Backend backend : backends) {
-            BackendService.Client client = null;
-            TNetworkAddress address = null;
-            boolean ok = false;
-            try {
-                address = new TNetworkAddress(backend.getHost(), backend.getBePort());
-                client = ClientPool.backendPool.borrowObject(address);
-                client.cleanTrash(); // async
-                ok = true;
-            } catch (Exception e) {
-                LOG.warn("trash clean exec error. backend[{}]", backend.getId(), e);
-            } finally {
-                if (ok) {
-                    ClientPool.backendPool.returnObject(address, client);
-                } else {
-                    ClientPool.backendPool.invalidateObject(address, client);
-                }
-            }
+            CleanTrashTask cleanTrashTask = new CleanTrashTask(backend.getId());
+            batchTask.addTask(cleanTrashTask);
+            LOG.info("clean trash in be {}, beId {}", backend.getHost(), backend.getId());
         }
+        AgentTaskExecutor.submit(batchTask);
     }
 
     public void setPartitionVersion(AdminSetPartitionVersionStmt stmt) throws DdlException {
@@ -6030,6 +6098,14 @@ public class Env {
         return statisticsAutoCollector;
     }
 
+    public NereidsSqlCacheManager getSqlCacheManager() {
+        return sqlCacheManager;
+    }
+
+    public SplitSourceManager getSplitSourceManager() {
+        return splitSourceManager;
+    }
+
     public void alterMTMVRefreshInfo(AlterMTMVRefreshInfo info) {
         AlterMTMV alter = new AlterMTMV(info.getMvName(), info.getRefreshInfo(), MTMVAlterOpType.ALTER_REFRESH_INFO);
         this.alter.processAlterMTMV(alter, false);
@@ -6114,3 +6190,4 @@ public class Env {
         }
     }
 }
+

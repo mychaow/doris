@@ -35,12 +35,37 @@
 namespace doris {
 
 namespace vectorized {
+
+class TestSplitSourceConnector : public SplitSourceConnector {
+private:
+    std::mutex _range_lock;
+    TFileScanRange _scan_range;
+    int _range_index = 0;
+
+public:
+    TestSplitSourceConnector(const TFileScanRange& scan_range) : _scan_range(scan_range) {}
+
+    Status get_next(bool* has_next, TFileRangeDesc* range) override {
+        std::lock_guard<std::mutex> l(_range_lock);
+        if (_range_index < _scan_range.ranges.size()) {
+            *has_next = true;
+            *range = _scan_range.ranges[_range_index++];
+        } else {
+            *has_next = false;
+        }
+        return Status::OK();
+    }
+
+    int num_scan_ranges() override { return _scan_range.ranges.size(); }
+
+    TFileScanRangeParams* get_params() override { return &_scan_range.params; }
+};
+
 class VWalScannerTest : public testing::Test {
 public:
     VWalScannerTest() : _runtime_state(TQueryGlobals()) {
         init();
         _profile = _runtime_state.runtime_profile();
-        _runtime_state.init_mem_trackers();
         WARN_IF_ERROR(_runtime_state.init(_unique_id, _query_options, _query_globals, _env),
                       "fail to init _runtime_state");
     }
@@ -267,7 +292,8 @@ void VWalScannerTest::init() {
 }
 
 void VWalScannerTest::generate_scanner(std::shared_ptr<VFileScanner>& scanner) {
-    scanner = std::make_shared<VFileScanner>(&_runtime_state, _scan_node.get(), -1, _scan_range,
+    auto split_source = std::make_shared<TestSplitSourceConnector>(_scan_range);
+    scanner = std::make_shared<VFileScanner>(&_runtime_state, _scan_node.get(), -1, split_source,
                                              _profile, _kv_cache.get());
     scanner->_is_load = false;
     vectorized::VExprContextSPtrs _conjuncts;

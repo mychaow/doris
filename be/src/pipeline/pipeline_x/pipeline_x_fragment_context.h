@@ -70,6 +70,13 @@ public:
 
     ~PipelineXFragmentContext() override;
 
+    void clear_finished_tasks() override {
+        for (size_t j = 0; j < _tasks.size(); j++) {
+            for (size_t i = 0; i < _tasks[j].size(); i++) {
+                _tasks[j][i]->stop_if_finished();
+            }
+        }
+    };
     void instance_ids(std::vector<TUniqueId>& ins_ids) const override {
         ins_ids.resize(_fragment_instance_ids.size());
         for (size_t i = 0; i < _fragment_instance_ids.size(); i++) {
@@ -103,11 +110,6 @@ public:
                 const std::string& msg = "") override;
 
     Status send_report(bool) override;
-
-    RuntimeFilterMgr* get_runtime_filter_mgr(UniqueId fragment_instance_id) override {
-        DCHECK(_runtime_filter_mgr_map.contains(fragment_instance_id));
-        return _runtime_filter_mgr_map[fragment_instance_id].get();
-    }
 
     [[nodiscard]] int next_operator_id() { return _operator_id--; }
 

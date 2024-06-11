@@ -71,6 +71,8 @@ public:
 
     bool is_timeout(const VecDateTimeValue& now) const;
 
+    int timeout_second() const { return _timeout; }
+
     PipelinePtr add_pipeline();
 
     PipelinePtr add_pipeline(PipelinePtr parent, int idx = -1);
@@ -78,10 +80,6 @@ public:
     TUniqueId get_fragment_instance_id() const { return _fragment_instance_id; }
 
     RuntimeState* get_runtime_state() { return _runtime_state.get(); }
-
-    virtual RuntimeFilterMgr* get_runtime_filter_mgr(UniqueId /*fragment_instance_id*/) {
-        return _runtime_state->local_runtime_filter_mgr();
-    }
 
     QueryContext* get_query_ctx() { return _query_ctx.get(); }
     // should be protected by lock?
@@ -113,6 +111,8 @@ public:
     [[nodiscard]] int get_fragment_id() const { return _fragment_id; }
 
     void close_a_pipeline();
+
+    virtual void clear_finished_tasks() {}
 
     virtual void add_merge_controller_handler(
             std::shared_ptr<RuntimeFilterMergeControllerEntity>& handler) {}
@@ -189,6 +189,8 @@ protected:
     std::vector<std::unique_ptr<DataSink>> _multi_cast_stream_sink_senders;
 
     std::shared_ptr<QueryContext> _query_ctx;
+
+    QueryThreadContext _query_thread_context;
 
     MonotonicStopWatch _fragment_watcher;
     RuntimeProfile::Counter* _start_timer = nullptr;

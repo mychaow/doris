@@ -118,6 +118,9 @@ DECLARE_String(priority_networks);
 // performance moderate or compact, only tcmalloc compile
 DECLARE_String(memory_mode);
 
+// if true, process memory limit and memory usage based on cgroup memory info.
+DECLARE_mBool(enable_use_cgroup_memory_info);
+
 // process memory limit specified as number of bytes
 // ('<int>[bB]?'), megabytes ('<float>[mM]'), gigabytes ('<float>[gG]'),
 // or percentage of the physical memory ('<int>%').
@@ -177,6 +180,9 @@ DECLARE_mBool(disable_memory_gc);
 // will print a warning containing the stacktrace, but not prevent memory alloc.
 // If is -1, disable large memory check.
 DECLARE_mInt64(large_memory_check_bytes);
+
+// default is true. if any memory tracking in Orphan mem tracker will report error.
+DECLARE_mBool(enable_memory_orphan_check);
 
 // The maximum time a thread waits for a full GC. Currently only query will wait for full gc.
 DECLARE_mInt32(thread_wait_gc_max_milliseconds);
@@ -244,10 +250,10 @@ DECLARE_mInt32(download_low_speed_limit_kbps);
 // download low speed time(seconds)
 DECLARE_mInt32(download_low_speed_time);
 
-// log dir
+// deprecated, use env var LOG_DIR in be.conf
 DECLARE_String(sys_log_dir);
+// for udf
 DECLARE_String(user_function_dir);
-DECLARE_String(pipeline_tracing_log_dir);
 // INFO, WARNING, ERROR, FATAL
 DECLARE_String(sys_log_level);
 // TIME-DAY, TIME-HOUR, SIZE-MB-nnn
@@ -276,6 +282,8 @@ DECLARE_mInt64(doris_blocking_priority_queue_wait_timeout_ms);
 // number of scanner thread pool size for olap table
 // and the min thread num of remote scanner thread pool
 DECLARE_mInt32(doris_scanner_thread_pool_thread_num);
+// number of batch size to fetch the remote split source
+DECLARE_mInt32(remote_split_source_batch_size);
 // max number of remote scanner thread pool size
 // if equal to -1, value is std::max(512, CpuInfo::num_cores() * 10)
 DECLARE_Int32(doris_max_remote_scanner_thread_pool_thread_num);
@@ -613,6 +621,9 @@ DECLARE_mInt32(memory_gc_sleep_time_ms);
 // Sleep time in milliseconds between memtbale flush mgr memory refresh iterations
 DECLARE_mInt64(memtable_mem_tracker_refresh_interval_ms);
 
+// Sleep time in milliseconds between refresh iterations of workload group memory statistics
+DECLARE_mInt64(wg_mem_refresh_interval_ms);
+
 // percent of (active memtables size / all memtables size) when reach hard limit
 DECLARE_mInt32(memtable_hard_limit_active_percent);
 
@@ -662,9 +673,9 @@ DECLARE_Bool(enable_metric_calculator);
 // max consumer num in one data consumer group, for routine load
 DECLARE_mInt32(max_consumer_num_per_group);
 
-// the size of thread pool for routine load task.
+// the max size of thread pool for routine load task.
 // this should be larger than FE config 'max_routine_load_task_num_per_be' (default 5)
-DECLARE_Int32(routine_load_thread_pool_size);
+DECLARE_Int32(max_routine_load_thread_pool_size);
 
 // max external scan cache batch count, means cache max_memory_cache_batch_count * batch_size row
 // default is 20, batch_size's default value is 1024 means 20 * 1024 rows will be cached
@@ -845,6 +856,7 @@ DECLARE_mInt32(jdbc_connection_pool_cache_clear_time_sec);
 
 // Global bitmap cache capacity for aggregation cache, size in bytes
 DECLARE_Int64(delete_bitmap_agg_cache_capacity);
+DECLARE_String(delete_bitmap_dynamic_agg_cache_limit);
 DECLARE_mInt32(delete_bitmap_agg_cache_stale_sweep_time_sec);
 
 // A common object cache depends on an Sharded LRU Cache.
@@ -862,7 +874,7 @@ DECLARE_mString(kafka_debug);
 // The number of pool siz of routine load consumer.
 // If you meet the error describe in https://github.com/edenhill/librdkafka/issues/3608
 // Change this size to 0 to fix it temporarily.
-DECLARE_Int32(routine_load_consumer_pool_size);
+DECLARE_mInt32(routine_load_consumer_pool_size);
 
 // Used in single-stream-multi-table load. When receive a batch of messages from kafka,
 // if the size of batch is more than this threshold, we will request plans for all related tables.
@@ -1071,6 +1083,9 @@ DECLARE_mInt32(schema_cache_sweep_time_sec);
 
 // max number of segment cache
 DECLARE_mInt32(segment_cache_capacity);
+DECLARE_mInt32(estimated_num_columns_per_segment);
+DECLARE_mInt32(estimated_mem_per_column_reader);
+DECLARE_Int32(segment_cache_memory_percentage);
 
 // enable binlog
 DECLARE_Bool(enable_feature_binlog);
@@ -1090,6 +1105,8 @@ DECLARE_mBool(enable_delete_when_cumu_compaction);
 // max_write_buffer_number for rocksdb
 DECLARE_Int32(rocksdb_max_write_buffer_number);
 
+// Convert date 0000-00-00 to 0000-01-01. It's recommended to set to false.
+DECLARE_mBool(allow_zero_date);
 // Allow invalid decimalv2 literal for compatible with old version. Recommend set it false strongly.
 DECLARE_mBool(allow_invalid_decimalv2_literal);
 // Allow to specify kerberos credentials cache path.
@@ -1189,6 +1206,8 @@ DECLARE_mBool(exit_on_exception);
 DECLARE_mString(doris_cgroup_cpu_path);
 DECLARE_mBool(enable_cgroup_cpu_soft_limit);
 
+DECLARE_mBool(enable_workload_group_memory_gc);
+
 // This config controls whether the s3 file writer would flush cache asynchronously
 DECLARE_Bool(enable_flush_file_cache_async);
 
@@ -1231,18 +1250,30 @@ DECLARE_mDouble(high_disk_avail_level_diff_usages);
 // create tablet in partition random robin idx lru size, default 10000
 DECLARE_Int32(partition_disk_index_lru_size);
 DECLARE_String(spill_storage_root_path);
-DECLARE_mInt64(spill_storage_limit);
+// Spill storage limit specified as number of bytes
+// ('<int>[bB]?'), megabytes ('<float>[mM]'), gigabytes ('<float>[gG]'),
+// or percentage of capaity ('<int>%').
+// Defaults to bytes if no unit is given.
+// Must larger than 0.
+// If specified as percentage, the final limit value is:
+//   disk_capacity_bytes * storage_flood_stage_usage_percent * spill_storage_limit
+DECLARE_String(spill_storage_limit);
 DECLARE_mInt32(spill_gc_interval_ms);
-DECLARE_Int32(spill_io_thread_pool_per_disk_thread_num);
+DECLARE_mInt32(spill_gc_work_time_ms);
+DECLARE_Int32(spill_io_thread_pool_thread_num);
 DECLARE_Int32(spill_io_thread_pool_queue_size);
-DECLARE_Int32(spill_async_task_thread_pool_thread_num);
-DECLARE_Int32(spill_async_task_thread_pool_queue_size);
-DECLARE_mInt32(spill_mem_warning_water_mark_multiplier);
 
 DECLARE_mBool(check_segment_when_build_rowset_meta);
 
 // max s3 client retry times
 DECLARE_mInt32(max_s3_client_retry);
+// When meet s3 429 error, the "get" request will
+// sleep s3_read_base_wait_time_ms (*1, *2, *3, *4) ms
+// get try again.
+// The max sleep time is s3_read_max_wait_time_ms
+// and the max retry time is max_s3_client_retry
+DECLARE_mInt32(s3_read_base_wait_time_ms);
+DECLARE_mInt32(s3_read_max_wait_time_ms);
 
 // write as inverted index tmp directory
 DECLARE_String(tmp_file_dir);
@@ -1251,21 +1282,37 @@ DECLARE_String(tmp_file_dir);
 DECLARE_mString(ca_cert_file_paths);
 
 /** Table sink configurations(currently contains only external table types) **/
-// Minimum data processed to scale writers when non partition writing
+// Minimum data processed to scale writers in exchange when non partition writing
 DECLARE_mInt64(table_sink_non_partition_write_scaling_data_processed_threshold);
-// Minimum data processed to start rebalancing in exchange when partition writing
-DECLARE_mInt64(table_sink_partition_write_data_processed_threshold);
 // Minimum data processed to trigger skewed partition rebalancing in exchange when partition writing
-DECLARE_mInt64(table_sink_partition_write_skewed_data_processed_rebalance_threshold);
+DECLARE_mInt64(table_sink_partition_write_min_data_processed_rebalance_threshold);
+// Minimum partition data processed to rebalance writers in exchange when partition writing
+DECLARE_mInt64(table_sink_partition_write_min_partition_data_processed_rebalance_threshold);
 // Maximum processed partition nums of per writer when partition writing
 DECLARE_mInt32(table_sink_partition_write_max_partition_nums_per_writer);
 
 /** Hive sink configurations **/
-DECLARE_mInt64(hive_sink_max_file_size); // 1GB
+DECLARE_mInt64(hive_sink_max_file_size);
+
+/** Iceberg sink configurations **/
+DECLARE_mInt64(iceberg_sink_max_file_size);
 
 // Number of open tries, default 1 means only try to open once.
 // Retry the Open num_retries time waiting 100 milliseconds between retries.
 DECLARE_mInt32(thrift_client_open_num_tries);
+
+DECLARE_mBool(ignore_schema_change_check);
+
+//JVM monitoring enable. To prevent be from crashing due to jvm compatibility issues.
+DECLARE_Bool(enable_jvm_monitor);
+
+// Skip loading stale rowset meta when initializing `TabletMeta` from protobuf
+DECLARE_mBool(skip_loading_stale_rowset_meta);
+// Whether to use file to record log. When starting BE with --console,
+// all logs will be written to both standard output and file.
+// Disable this option will no longer use file to record log.
+// Only works when starting BE with --console.
+DECLARE_Bool(enable_file_logger);
 
 #ifdef BE_TEST
 // test s3

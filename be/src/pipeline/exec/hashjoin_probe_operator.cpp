@@ -373,6 +373,15 @@ Status HashJoinProbeOperatorX::pull(doris::RuntimeState* state, vectorized::Bloc
     return Status::OK();
 }
 
+std::string HashJoinProbeLocalState::debug_string(int indentation_level) const {
+    fmt::memory_buffer debug_string_buffer;
+    fmt::format_to(debug_string_buffer, "{}, short_circuit_for_probe: {}",
+                   JoinProbeLocalState<HashJoinSharedState, HashJoinProbeLocalState>::debug_string(
+                           indentation_level),
+                   _shared_state ? std::to_string(_shared_state->short_circuit_for_probe) : "NULL");
+    return fmt::to_string(debug_string_buffer);
+}
+
 Status HashJoinProbeLocalState::_extract_join_column(vectorized::Block& block,
                                                      vectorized::ColumnUInt8::MutablePtr& null_map,
                                                      vectorized::ColumnRawPtrs& raw_ptrs,
@@ -486,12 +495,12 @@ Status HashJoinProbeOperatorX::push(RuntimeState* state, vectorized::Block* inpu
         local_state._probe_columns.resize(probe_expr_ctxs_sz);
 
         std::vector<int> res_col_ids(probe_expr_ctxs_sz);
+        RETURN_IF_ERROR(_do_evaluate(*input_block, local_state._probe_expr_ctxs,
+                                     *local_state._probe_expr_call_timer, res_col_ids));
         if (_join_op == TJoinOp::RIGHT_OUTER_JOIN || _join_op == TJoinOp::FULL_OUTER_JOIN) {
             local_state._probe_column_convert_to_null =
                     local_state._convert_block_to_null(*input_block);
         }
-        RETURN_IF_ERROR(_do_evaluate(*input_block, local_state._probe_expr_ctxs,
-                                     *local_state._probe_expr_call_timer, res_col_ids));
 
         // TODO: Now we are not sure whether a column is nullable only by ExecNode's `row_desc`
         //  so we have to initialize this flag by the first probe block.

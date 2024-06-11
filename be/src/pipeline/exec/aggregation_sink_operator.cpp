@@ -63,22 +63,9 @@ AggSinkLocalState::AggSinkLocalState(DataSinkOperatorXBase* parent, RuntimeState
 Status AggSinkLocalState::init(RuntimeState* state, LocalSinkStateInfo& info) {
     RETURN_IF_ERROR(Base::init(state, info));
     SCOPED_TIMER(Base::exec_time_counter());
-    SCOPED_TIMER(Base::_open_timer);
+    SCOPED_TIMER(Base::_init_timer);
     _agg_data = Base::_shared_state->agg_data.get();
     _agg_arena_pool = Base::_shared_state->agg_arena_pool.get();
-    auto& p = Base::_parent->template cast<AggSinkOperatorX>();
-    Base::_shared_state->align_aggregate_states = p._align_aggregate_states;
-    Base::_shared_state->total_size_of_aggregate_states = p._total_size_of_aggregate_states;
-    Base::_shared_state->offsets_of_aggregate_states = p._offsets_of_aggregate_states;
-    Base::_shared_state->make_nullable_keys = p._make_nullable_keys;
-    for (auto& evaluator : p._aggregate_evaluators) {
-        Base::_shared_state->aggregate_evaluators.push_back(evaluator->clone(state, p._pool));
-    }
-    Base::_shared_state->probe_expr_ctxs.resize(p._probe_expr_ctxs.size());
-    for (size_t i = 0; i < Base::_shared_state->probe_expr_ctxs.size(); i++) {
-        RETURN_IF_ERROR(
-                p._probe_expr_ctxs[i]->clone(state, Base::_shared_state->probe_expr_ctxs[i]));
-    }
     _hash_table_memory_usage = ADD_CHILD_COUNTER_WITH_LEVEL(Base::profile(), "HashTable",
                                                             TUnit::BYTES, "MemoryUsage", 1);
     _serialize_key_arena_memory_usage = Base::profile()->AddHighWaterMarkCounter(
@@ -95,12 +82,30 @@ Status AggSinkLocalState::init(RuntimeState* state, LocalSinkStateInfo& info) {
     _hash_table_emplace_timer = ADD_TIMER(Base::profile(), "HashTableEmplaceTime");
     _hash_table_input_counter = ADD_COUNTER(Base::profile(), "HashTableInputCount", TUnit::UNIT);
     _max_row_size_counter = ADD_COUNTER(Base::profile(), "MaxRowSizeInBytes", TUnit::UNIT);
-    COUNTER_SET(_max_row_size_counter, (int64_t)0);
 
+    return Status::OK();
+}
+
+Status AggSinkLocalState::open(RuntimeState* state) {
+    SCOPED_TIMER(Base::exec_time_counter());
+    SCOPED_TIMER(Base::_open_timer);
+    RETURN_IF_ERROR(Base::open(state));
+    auto& p = Base::_parent->template cast<AggSinkOperatorX>();
+    Base::_shared_state->align_aggregate_states = p._align_aggregate_states;
+    Base::_shared_state->total_size_of_aggregate_states = p._total_size_of_aggregate_states;
+    Base::_shared_state->offsets_of_aggregate_states = p._offsets_of_aggregate_states;
+    Base::_shared_state->make_nullable_keys = p._make_nullable_keys;
+    for (auto& evaluator : p._aggregate_evaluators) {
+        Base::_shared_state->aggregate_evaluators.push_back(evaluator->clone(state, p._pool));
+    }
+    Base::_shared_state->probe_expr_ctxs.resize(p._probe_expr_ctxs.size());
+    for (size_t i = 0; i < Base::_shared_state->probe_expr_ctxs.size(); i++) {
+        RETURN_IF_ERROR(
+                p._probe_expr_ctxs[i]->clone(state, Base::_shared_state->probe_expr_ctxs[i]));
+    }
     for (auto& evaluator : Base::_shared_state->aggregate_evaluators) {
         evaluator->set_timer(_merge_timer, _expr_timer);
     }
-
     Base::_shared_state->agg_profile_arena = std::make_unique<vectorized::Arena>();
 
     if (Base::_shared_state->probe_expr_ctxs.empty()) {
@@ -137,17 +142,9 @@ Status AggSinkLocalState::init(RuntimeState* state, LocalSinkStateInfo& info) {
 
         _should_limit_output = p._limit != -1 &&       // has limit
                                (!p._have_conjuncts) && // no having conjunct
-                               p._needs_finalize;      // agg's finalize step
+                               p._needs_finalize &&    // agg's finalize step
+                               !Base::_shared_state->enable_spill;
     }
-
-    return Status::OK();
-}
-
-Status AggSinkLocalState::open(RuntimeState* state) {
-    SCOPED_TIMER(Base::exec_time_counter());
-    SCOPED_TIMER(Base::_open_timer);
-    RETURN_IF_ERROR(Base::open(state));
-    _agg_data = Base::_shared_state->agg_data.get();
     // move _create_agg_status to open not in during prepare,
     // because during prepare and open thread is not the same one,
     // this could cause unable to get JVM
@@ -304,8 +301,7 @@ Status AggSinkLocalState::_merge_with_serialized_key_helper(vectorized::Block* b
                                     _places.data(),
                                     Base::_parent->template cast<AggSinkOperatorX>()
                                             ._offsets_of_aggregate_states[i],
-                                    _deserialize_buffer.data(),
-                                    (vectorized::ColumnString*)(column.get()), _agg_arena_pool,
+                                    _deserialize_buffer.data(), column.get(), _agg_arena_pool,
                                     rows);
                 }
             } else {
@@ -349,8 +345,7 @@ Status AggSinkLocalState::_merge_with_serialized_key_helper(vectorized::Block* b
                                     _places.data(),
                                     Base::_parent->template cast<AggSinkOperatorX>()
                                             ._offsets_of_aggregate_states[i],
-                                    _deserialize_buffer.data(),
-                                    (vectorized::ColumnString*)(column.get()), _agg_arena_pool,
+                                    _deserialize_buffer.data(), column.get(), _agg_arena_pool,
                                     rows);
                 }
             } else {
@@ -465,7 +460,7 @@ Status AggSinkLocalState::_execute_with_serialized_key_helper(vectorized::Block*
                     _places.data(), _agg_arena_pool));
         }
 
-        if (_should_limit_output && !Base::_shared_state->enable_spill) {
+        if (_should_limit_output) {
             _reach_limit = _get_hash_table_size() >=
                            Base::_parent->template cast<AggSinkOperatorX>()._limit;
             if (_reach_limit &&
@@ -635,7 +630,8 @@ AggSinkOperatorX::AggSinkOperatorX(ObjectPool* pool, int operator_id, const TPla
                           (tnode.__isset.conjuncts && !tnode.conjuncts.empty())),
           _partition_exprs(tnode.__isset.distribute_expr_lists ? tnode.distribute_expr_lists[0]
                                                                : std::vector<TExpr> {}),
-          _is_colocate(tnode.agg_node.__isset.is_colocate && tnode.agg_node.is_colocate) {}
+          _is_colocate(tnode.agg_node.__isset.is_colocate && tnode.agg_node.is_colocate),
+          _agg_fn_output_row_descriptor(descs, tnode.row_tuples, tnode.nullable_tuples) {}
 
 Status AggSinkOperatorX::init(const TPlanNode& tnode, RuntimeState* state) {
     RETURN_IF_ERROR(DataSinkOperatorX<AggSinkLocalState>::init(tnode, state));
@@ -718,7 +714,11 @@ Status AggSinkOperatorX::prepare(RuntimeState* state) {
                     alignment_of_next_state * alignment_of_next_state;
         }
     }
-
+    // check output type
+    if (_needs_finalize) {
+        RETURN_IF_ERROR(vectorized::AggFnEvaluator::check_agg_fn_output(
+                _probe_expr_ctxs.size(), _aggregate_evaluators, _agg_fn_output_row_descriptor));
+    }
     return Status::OK();
 }
 

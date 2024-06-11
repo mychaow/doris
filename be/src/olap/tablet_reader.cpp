@@ -497,7 +497,7 @@ Status TabletReader::_init_conditions_param(const ReaderParams& read_params) {
             // record condition value into predicate_params in order to pushdown segment_iterator,
             // _gen_predicate_result_sign will build predicate result unique sign with condition value
             auto predicate_params = predicate->predicate_params();
-            predicate_params->value = condition.condition_values[0];
+            predicate_params->values = condition.condition_values;
             predicate_params->marked_by_runtime_filter = condition.marked_by_runtime_filter;
             if (column.aggregation() != FieldAggregationMethod::OLAP_FIELD_AGGREGATION_NONE) {
                 _value_col_predicates.push_back(predicate);
@@ -569,7 +569,7 @@ Status TabletReader::_init_conditions_param_except_leafnode_of_andnode(
         if (predicate != nullptr) {
             auto predicate_params = predicate->predicate_params();
             predicate_params->marked_by_runtime_filter = condition.marked_by_runtime_filter;
-            predicate_params->value = condition.condition_values[0];
+            predicate_params->values = condition.condition_values;
             _col_preds_except_leafnode_of_andnode.push_back(predicate);
         }
     }
@@ -643,13 +643,7 @@ Status TabletReader::_init_delete_condition(const ReaderParams& read_params) {
                       ((read_params.reader_type == ReaderType::READER_CUMULATIVE_COMPACTION &&
                         config::enable_delete_when_cumu_compaction)) ||
                       read_params.reader_type == ReaderType::READER_CHECKSUM);
-    if (_filter_delete) {
-        // note(tsy): for compaction, keep delete sub pred v1 temporarily
-        return _delete_handler.init(_tablet_schema, read_params.delete_predicates,
-                                    read_params.version.second, false);
-    }
     auto* runtime_state = read_params.runtime_state;
-    // note(tsy): for query, use session var to enable delete sub pred v2, for schema change, use v2 directly
     bool enable_sub_pred_v2 =
             runtime_state == nullptr ? true : runtime_state->enable_delete_sub_pred_v2();
     return _delete_handler.init(_tablet_schema, read_params.delete_predicates,

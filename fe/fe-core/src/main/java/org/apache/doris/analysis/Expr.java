@@ -57,8 +57,6 @@ import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import org.apache.commons.collections.CollectionUtils;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
 
 import java.io.DataInput;
 import java.io.DataOutput;
@@ -79,8 +77,6 @@ import java.util.stream.Collectors;
  */
 public abstract class Expr extends TreeNode<Expr> implements ParseNode, Cloneable, Writable, ExprStats {
 
-    private static final Logger LOG = LogManager.getLogger(Expr.class);
-
     // Name of the function that needs to be implemented by every Expr that
     // supports negation.
     private static final String NEGATE_FN = "negate";
@@ -100,6 +96,8 @@ public abstract class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
     public static final double DEFAULT_SELECTIVITY = 0.1;
 
     public static final float FUNCTION_CALL_COST = 10;
+
+    protected Optional<Boolean> nullableFromNereids = Optional.empty();
 
     // returns true if an Expr is a non-analytic aggregate.
     private static final com.google.common.base.Predicate<Expr> IS_AGGREGATE_PREDICATE =
@@ -237,27 +235,6 @@ public abstract class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
         selectivity = -1;
     }
 
-    /* TODO(zc)
-    public final static com.google.common.base.Predicate<Expr>
-            IS_NONDETERMINISTIC_BUILTIN_FN_PREDICATE =
-            new com.google.common.base.Predicate<Expr>() {
-                @Override
-                public boolean apply(Expr arg) {
-                    return arg instanceof FunctionCallExpr
-                            && ((FunctionCallExpr) arg).isNondeterministicBuiltinFn();
-                }
-            };
-
-    public final static com.google.common.base.Predicate<Expr> IS_UDF_PREDICATE =
-            new com.google.common.base.Predicate<Expr>() {
-                @Override
-                public boolean apply(Expr arg) {
-                    return arg instanceof FunctionCallExpr
-                            && !((FunctionCallExpr) arg).getFnName().isBuiltin();
-                }
-            };
-    */
-
     // id that's unique across the entire query statement and is assigned by
     // Analyzer.registerConjuncts(); only assigned for the top-level terms of a
     // conjunction, and therefore null for most Exprs
@@ -275,7 +252,6 @@ public abstract class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
     protected boolean isAnalyzed = false;  // true after analyze() has been called
 
     protected TExprOpcode opcode;  // opcode for this expr
-    protected TExprOpcode vectorOpcode;  // vector opcode for this expr
 
     // estimated probability of a predicate evaluating to true;
     // set during analysis;
@@ -287,8 +263,6 @@ public abstract class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
     protected long numDistinctValues;
 
     protected int outputScale = -1;
-
-    protected int outputColumn = -1;
 
     protected boolean isFilter = false;
 
@@ -310,7 +284,6 @@ public abstract class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
         super();
         type = Type.INVALID;
         opcode = TExprOpcode.INVALID_OPCODE;
-        vectorOpcode = TExprOpcode.INVALID_OPCODE;
         selectivity = -1.0;
         numDistinctValues = -1;
     }
@@ -388,10 +361,6 @@ public abstract class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
         if (scale > 0 && scale < 10) {
             outputScale = scale;
         }
-    }
-
-    public int getOutputColumn() {
-        return outputColumn;
     }
 
     public boolean isFilter() {
@@ -943,31 +912,6 @@ public abstract class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
         return numDistinctValues;
     }
 
-    public void vectorizedAnalyze(Analyzer analyzer) {
-        for (Expr child : children) {
-            child.vectorizedAnalyze(analyzer);
-        }
-    }
-
-    public void computeOutputColumn(Analyzer analyzer) {
-        for (Expr child : children) {
-            child.computeOutputColumn(analyzer);
-            LOG.info("child " + child.debugString() + " outputColumn: " + child.getOutputColumn());
-        }
-
-        if (!isConstant() && !isFilter) {
-            List<TupleId> tupleIds = Lists.newArrayList();
-            getIds(tupleIds, null);
-            Preconditions.checkArgument(tupleIds.size() == 1);
-
-            int currentOutputColumn = analyzer.getCurrentOutputColumn(tupleIds.get(0));
-            this.outputColumn = currentOutputColumn;
-            LOG.info(debugString() + " outputColumn: " + this.outputColumn);
-            ++currentOutputColumn;
-            analyzer.setCurrentOutputColumn(tupleIds.get(0), currentOutputColumn);
-        }
-    }
-
     public String toSql() {
         return (printSqlInParens) ? "(" + toSqlImpl() + ")" : toSqlImpl();
     }
@@ -1056,7 +1000,7 @@ public abstract class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
             }
         }
         msg.output_scale = getOutputScale();
-        msg.setIsNullable(isNullable());
+        msg.setIsNullable(nullableFromNereids.isPresent() ? nullableFromNereids.get() : isNullable());
         toThrift(msg);
         container.addToNodes(msg);
         for (Expr child : children) {
@@ -1529,7 +1473,7 @@ public abstract class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
      *                           failure to convert a string literal to a date literal
      */
     public final Expr castTo(Type targetType) throws AnalysisException {
-        if (this instanceof PlaceHolderExpr && this.type.isInvalid()) {
+        if (this instanceof PlaceHolderExpr && this.type.isUnsupported()) {
             return this;
         }
         // If the targetType is NULL_TYPE then ignore the cast because NULL_TYPE
@@ -1980,11 +1924,11 @@ public abstract class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
                 f.setNullableMode(NullableMode.ALWAYS_NOT_NULLABLE);
             } else {
                 Function original = f;
-                f = ((AggregateFunction) f).clone();
+                f = f.clone();
                 f.setArgs(argList);
                 if (isUnion) {
                     f.setName(new FunctionName(name + AGG_UNION_SUFFIX));
-                    f.setReturnType((ScalarType) argList.get(0));
+                    f.setReturnType(argList.get(0));
                     f.setNullableMode(NullableMode.ALWAYS_NOT_NULLABLE);
                 }
                 if (isMerge) {
@@ -2337,6 +2281,15 @@ public abstract class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
         return false;
     }
 
+    public boolean hasAutoInc() {
+        for (Expr expr : children) {
+            if (expr.hasAutoInc()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /**
      * For excute expr the result is nullable
      * TODO: Now only SlotRef and LiteralExpr overwrite the method, each child of Expr should
@@ -2651,6 +2604,10 @@ public abstract class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
 
     public boolean isZeroLiteral() {
         return this instanceof LiteralExpr && ((LiteralExpr) this).isZero();
+    }
+
+    public void setNullableFromNereids(boolean nullable) {
+        nullableFromNereids = Optional.of(nullable);
     }
 }
 

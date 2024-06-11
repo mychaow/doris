@@ -189,6 +189,10 @@ public class RestoreJob extends AbstractJob {
         this.state = RestoreJobState.PENDING;
         this.metaVersion = metaVersion;
         this.reserveReplica = reserveReplica;
+        // if backup snapshot is come from a cluster with force replication allocation, ignore the origin allocation
+        if (jobInfo.isForceReplicationAllocation) {
+            this.reserveReplica = false;
+        }
         this.reserveDynamicPartitionEnable = reserveDynamicPartitionEnable;
         this.isBeingSynced = isBeingSynced;
         properties.put(PROP_RESERVE_REPLICA, String.valueOf(reserveReplica));
@@ -618,12 +622,17 @@ public class RestoreJob extends AbstractJob {
                         if (LOG.isDebugEnabled()) {
                             LOG.debug("get intersect part names: {}, job: {}", intersectPartNames, this);
                         }
-                        if (!localOlapTbl.getSignature(BackupHandler.SIGNATURE_VERSION, intersectPartNames)
-                                .equals(remoteOlapTbl.getSignature(
-                                        BackupHandler.SIGNATURE_VERSION, intersectPartNames))) {
+                        String localTblSignature = localOlapTbl.getSignature(
+                                BackupHandler.SIGNATURE_VERSION, intersectPartNames);
+                        String remoteTblSignature = remoteOlapTbl.getSignature(
+                                BackupHandler.SIGNATURE_VERSION, intersectPartNames);
+                        if (!localTblSignature.equals(remoteTblSignature)) {
+                            String alias = jobInfo.getAliasByOriginNameIfSet(tableName);
+                            LOG.warn("Table {} already exists but with different schema, "
+                                    + "local table: {}, remote table: {}",
+                                    alias, localTblSignature, remoteTblSignature);
                             status = new Status(ErrCode.COMMON_ERROR, "Table "
-                                    + jobInfo.getAliasByOriginNameIfSet(tableName)
-                                    + " already exist but with different schema");
+                                    + alias + " already exist but with different schema");
                             return;
                         }
 
@@ -812,7 +821,11 @@ public class RestoreJob extends AbstractJob {
                     }
                 }
                 // set restored table's new name after all 'genFileMapping'
-                restoreTbl.setName(jobInfo.getAliasByOriginNameIfSet(restoreTbl.getName()));
+                String tableName = jobInfo.getAliasByOriginNameIfSet(restoreTbl.getName());
+                if (Env.isStoredTableNamesLowerCase()) {
+                    tableName = tableName.toLowerCase();
+                }
+                restoreTbl.setName(tableName);
             }
 
             if (LOG.isDebugEnabled()) {
@@ -1796,6 +1809,8 @@ public class RestoreJob extends AbstractJob {
             releaseSnapshots();
 
             snapshotInfos.clear();
+            fileMapping.clear();
+            jobInfo.releaseSnapshotInfo();
 
             finishedTime = System.currentTimeMillis();
             state = RestoreJobState.FINISHED;
@@ -1988,6 +2003,9 @@ public class RestoreJob extends AbstractJob {
             releaseSnapshots();
 
             snapshotInfos.clear();
+            fileMapping.clear();
+            jobInfo.releaseSnapshotInfo();
+
             RestoreJobState curState = state;
             finishedTime = System.currentTimeMillis();
             state = RestoreJobState.CANCELLED;
@@ -2006,6 +2024,7 @@ public class RestoreJob extends AbstractJob {
         for (String tableName : jobInfo.backupOlapTableObjects.keySet()) {
             Table tbl = db.getTableNullable(jobInfo.getAliasByOriginNameIfSet(tableName));
             if (tbl == null) {
+                LOG.warn("table {} is not found and skip set state to normal", tableName);
                 continue;
             }
 
@@ -2020,6 +2039,7 @@ public class RestoreJob extends AbstractJob {
             try {
                 if (olapTbl.getState() == OlapTableState.RESTORE
                         || olapTbl.getState() == OlapTableState.RESTORE_WITH_LOAD) {
+                    LOG.info("table {} set state from {} to normal", tableName, olapTbl.getState());
                     olapTbl.setState(OlapTableState.NORMAL);
                 }
 
@@ -2028,6 +2048,8 @@ public class RestoreJob extends AbstractJob {
                     String partitionName = partitionEntry.getKey();
                     Partition partition = olapTbl.getPartition(partitionName);
                     if (partition == null) {
+                        LOG.warn("table {} partition {} is not found and skip set state to normal",
+                                tableName, partitionName);
                         continue;
                     }
                     if (partition.getState() == PartitionState.RESTORE) {

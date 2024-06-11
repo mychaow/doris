@@ -76,8 +76,7 @@ private:
                 : _partitioner(partitioner) {}
 
         int get_partition(vectorized::Block* block, int position) {
-            uint32_t* partition_ids = (uint32_t*)_partitioner->get_channel_ids();
-            return partition_ids[position];
+            return _partitioner->get_channel_ids().get<uint32_t>()[position];
         }
 
     private:
@@ -132,6 +131,8 @@ public:
     RuntimeProfile::Counter* compress_timer() { return _compress_timer; }
     RuntimeProfile::Counter* uncompressed_bytes_counter() { return _uncompressed_bytes_counter; }
     [[nodiscard]] bool transfer_large_data_by_brpc() const;
+    bool is_finished() const override { return _reach_limit.load(); }
+    void set_reach_limit() { _reach_limit = true; };
 
     [[nodiscard]] int sender_id() const { return _sender_id; }
 
@@ -158,7 +159,7 @@ private:
     friend class vectorized::PipChannel<ExchangeSinkLocalState>;
     friend class vectorized::BlockSerializer<ExchangeSinkLocalState>;
 
-    std::unique_ptr<ExchangeSinkBuffer<ExchangeSinkLocalState>> _sink_buffer;
+    std::unique_ptr<ExchangeSinkBuffer<ExchangeSinkLocalState>> _sink_buffer = nullptr;
     RuntimeProfile::Counter* _serialize_batch_timer = nullptr;
     RuntimeProfile::Counter* _compress_timer = nullptr;
     RuntimeProfile::Counter* _brpc_send_timer = nullptr;
@@ -232,6 +233,7 @@ private:
 
     // for external table sink hash partition
     std::unique_ptr<HashPartitionFunction> _partition_function = nullptr;
+    std::atomic<bool> _reach_limit = false;
 };
 
 class ExchangeSinkOperatorX final : public DataSinkOperatorX<ExchangeSinkLocalState> {
@@ -268,7 +270,7 @@ private:
                                      vectorized::Block* block, bool eos);
     RuntimeState* _state = nullptr;
 
-    const std::vector<TExpr>& _texprs;
+    const std::vector<TExpr> _texprs;
 
     const RowDescriptor& _row_desc;
 
@@ -291,10 +293,10 @@ private:
     segment_v2::CompressionTypePB _compression_type;
 
     // for tablet sink shuffle
-    const TOlapTableSchemaParam& _tablet_sink_schema;
-    const TOlapTablePartitionParam& _tablet_sink_partition;
-    const TOlapTableLocationParam& _tablet_sink_location;
-    const TTupleId& _tablet_sink_tuple_id;
+    const TOlapTableSchemaParam _tablet_sink_schema;
+    const TOlapTablePartitionParam _tablet_sink_partition;
+    const TOlapTableLocationParam _tablet_sink_location;
+    const TTupleId _tablet_sink_tuple_id;
     int64_t _tablet_sink_txn_id = -1;
     std::shared_ptr<ObjectPool> _pool;
 

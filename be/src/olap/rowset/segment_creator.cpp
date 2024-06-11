@@ -259,6 +259,9 @@ Status SegmentFlusher::_flush_segment_writer(
         std::unique_ptr<segment_v2::VerticalSegmentWriter>& writer, TabletSchemaSPtr flush_schema,
         int64_t* flush_size) {
     uint32_t row_num = writer->num_rows_written();
+    _num_rows_updated += writer->num_rows_updated();
+    _num_rows_deleted += writer->num_rows_deleted();
+    _num_rows_new_added += writer->num_rows_new_added();
     _num_rows_filtered += writer->num_rows_filtered();
 
     if (row_num == 0) {
@@ -301,6 +304,9 @@ Status SegmentFlusher::_flush_segment_writer(
 Status SegmentFlusher::_flush_segment_writer(std::unique_ptr<segment_v2::SegmentWriter>& writer,
                                              TabletSchemaSPtr flush_schema, int64_t* flush_size) {
     uint32_t row_num = writer->num_rows_written();
+    _num_rows_updated += writer->num_rows_updated();
+    _num_rows_deleted += writer->num_rows_deleted();
+    _num_rows_new_added += writer->num_rows_new_added();
     _num_rows_filtered += writer->num_rows_filtered();
 
     if (row_num == 0) {
@@ -389,6 +395,7 @@ Status SegmentCreator::add_block(const vectorized::Block* block) {
         if (_buffer_block.allocated_bytes() > config::write_buffer_size) {
             vectorized::Block block = _buffer_block.to_block();
             RETURN_IF_ERROR(flush_single_block(&block));
+            _buffer_block.clear();
         } else {
             RETURN_IF_ERROR(_buffer_block.merge(*block));
         }
@@ -420,6 +427,7 @@ Status SegmentCreator::flush() {
     if (_buffer_block.rows() > 0) {
         vectorized::Block block = _buffer_block.to_block();
         RETURN_IF_ERROR(flush_single_block(&block));
+        _buffer_block.clear();
     }
     if (_flush_writer == nullptr) {
         return Status::OK();

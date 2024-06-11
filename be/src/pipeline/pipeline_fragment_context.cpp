@@ -60,6 +60,7 @@
 #include "pipeline/exec/hashjoin_build_sink.h"
 #include "pipeline/exec/hashjoin_probe_operator.h"
 #include "pipeline/exec/hive_table_sink_operator.h"
+#include "pipeline/exec/iceberg_table_sink_operator.h"
 #include "pipeline/exec/multi_cast_data_stream_sink.h"
 #include "pipeline/exec/multi_cast_data_stream_source.h"
 #include "pipeline/exec/mysql_scan_operator.h" // IWYU pragma: keep
@@ -134,18 +135,25 @@ PipelineFragmentContext::PipelineFragmentContext(
           _create_time(MonotonicNanos()) {
     _fragment_watcher.start();
     _start_time = VecDateTimeValue::local_time();
+    _query_thread_context = {query_id, _query_ctx->query_mem_tracker};
 }
 
 PipelineFragmentContext::~PipelineFragmentContext() {
+    // The memory released by the query end is recorded in the query mem tracker.
+    SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(_query_thread_context.query_mem_tracker);
     auto st = _query_ctx->exec_status();
+    _query_ctx.reset();
+    _tasks.clear();
     if (_runtime_state != nullptr) {
-        // The memory released by the query end is recorded in the query mem tracker, main memory in _runtime_state.
-        SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(_runtime_state->query_mem_tracker());
         _call_back(_runtime_state.get(), &st);
         _runtime_state.reset();
     } else {
         _call_back(_runtime_state.get(), &st);
     }
+    _root_pipeline.reset();
+    _pipelines.clear();
+    _sink.reset();
+    _multi_cast_stream_sink_senders.clear();
 }
 
 bool PipelineFragmentContext::is_timeout(const VecDateTimeValue& now) const {
@@ -250,10 +258,9 @@ Status PipelineFragmentContext::prepare(const doris::TPipelineFragmentParams& re
             request.query_options, _query_ctx->query_globals, _exec_env, _query_ctx.get());
 
     _runtime_state->set_task_execution_context(shared_from_this());
-    _runtime_state->set_query_mem_tracker(_query_ctx->query_mem_tracker);
 
     // TODO should be combine with plan_fragment_executor.prepare funciton
-    SCOPED_ATTACH_TASK(_runtime_state.get());
+    SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(_runtime_state->query_mem_tracker());
     _runtime_state->set_be_number(local_params.backend_num);
 
     if (request.__isset.backend_id) {
@@ -267,6 +274,9 @@ Status PipelineFragmentContext::prepare(const doris::TPipelineFragmentParams& re
     }
     if (request.__isset.load_job_id) {
         _runtime_state->set_load_job_id(request.load_job_id);
+    }
+    if (request.__isset.wal_id) {
+        _runtime_state->set_wal_id(request.wal_id);
     }
 
     if (request.query_options.__isset.is_report_success) {
@@ -460,7 +470,11 @@ void PipelineFragmentContext::trigger_report_if_necessary() {
                 // _runtime_state->load_channel_profile()->compute_time_in_profile(); // TODO load channel profile add timer
                 _runtime_state->load_channel_profile()->pretty_print(&ss);
             }
-            VLOG_FILE << ss.str();
+
+            VLOG_FILE << "Query " << print_id(this->get_query_id()) << " fragment "
+                      << this->get_fragment_id() << " instance "
+                      << print_id(this->get_fragment_instance_id()) << " profile:\n"
+                      << ss.str();
         }
         auto st = send_report(false);
         if (!st.ok()) {
@@ -532,6 +546,7 @@ Status PipelineFragmentContext::_build_pipelines(ExecNode* node, PipelinePtr cur
         } else {
             int child_count = union_node->children_count();
             auto data_queue = std::make_shared<DataQueue>(child_count);
+            data_queue->set_max_blocks_in_sub_queue(_runtime_state->data_queue_max_blocks());
             for (int child_id = 0; child_id < child_count; ++child_id) {
                 auto new_child_pipeline = add_pipeline();
                 RETURN_IF_ERROR(_build_pipelines(union_node->child(child_id), new_child_pipeline));
@@ -546,11 +561,19 @@ Status PipelineFragmentContext::_build_pipelines(ExecNode* node, PipelinePtr cur
         break;
     }
     case TPlanNodeType::AGGREGATION_NODE: {
-        auto* agg_node = dynamic_cast<vectorized::AggregationNode*>(node);
+        auto* agg_node = static_cast<vectorized::AggregationNode*>(node);
         auto new_pipe = add_pipeline();
         RETURN_IF_ERROR(_build_pipelines(node->child(0), new_pipe));
-        if (agg_node->is_aggregate_evaluators_empty()) {
+        if (agg_node->is_probe_expr_ctxs_empty() && agg_node->agg_output_desc()->slots().empty()) {
+            return Status::InternalError("Illegal aggregate node " +
+                                         std::to_string(agg_node->id()) +
+                                         ": group by and output is empty");
+        }
+
+        const int64_t data_queue_max_blocks = _runtime_state->data_queue_max_blocks();
+        if (agg_node->is_aggregate_evaluators_empty() && !agg_node->is_probe_expr_ctxs_empty()) {
             auto data_queue = std::make_shared<DataQueue>(1);
+            data_queue->set_max_blocks_in_sub_queue(data_queue_max_blocks);
             OperatorBuilderPtr pre_agg_sink =
                     std::make_shared<DistinctStreamingAggSinkOperatorBuilder>(node->id(), agg_node,
                                                                               data_queue);
@@ -560,8 +583,9 @@ Status PipelineFragmentContext::_build_pipelines(ExecNode* node, PipelinePtr cur
                     std::make_shared<DistinctStreamingAggSourceOperatorBuilder>(
                             node->id(), agg_node, data_queue);
             RETURN_IF_ERROR(cur_pipe->add_operator(pre_agg_source));
-        } else if (agg_node->is_streaming_preagg()) {
+        } else if (agg_node->is_streaming_preagg() && !agg_node->is_probe_expr_ctxs_empty()) {
             auto data_queue = std::make_shared<DataQueue>(1);
+            data_queue->set_max_blocks_in_sub_queue(data_queue_max_blocks);
             OperatorBuilderPtr pre_agg_sink = std::make_shared<StreamingAggSinkOperatorBuilder>(
                     node->id(), agg_node, data_queue);
             RETURN_IF_ERROR(new_pipe->set_sink_builder(pre_agg_sink));
@@ -830,6 +854,11 @@ Status PipelineFragmentContext::_create_sink(int sender_id, const TDataSink& thr
                                                                _sink.get());
         break;
     }
+    case TDataSinkType::ICEBERG_TABLE_SINK: {
+        sink_ = std::make_shared<IcebergTableSinkOperatorBuilder>(next_operator_builder_id(),
+                                                                  _sink.get());
+        break;
+    }
     case TDataSinkType::MYSQL_TABLE_SINK:
     case TDataSinkType::JDBC_TABLE_SINK:
     case TDataSinkType::ODBC_TABLE_SINK:
@@ -917,7 +946,9 @@ void PipelineFragmentContext::_close_fragment_instance() {
         if (_runtime_state->load_channel_profile()) {
             _runtime_state->load_channel_profile()->pretty_print(&ss);
         }
-        LOG(INFO) << ss.str();
+
+        LOG_INFO("Query {} fragment {} instance {} profile:\n {}", print_id(this->_query_id),
+                 this->_fragment_id, print_id(this->get_fragment_instance_id()), ss.str());
     }
     // all submitted tasks done
     _exec_env->fragment_mgr()->remove_pipeline_context(

@@ -49,7 +49,7 @@ public abstract class AbstractInsertExecutor {
     protected long jobId;
     protected final ConnectContext ctx;
     protected final Coordinator coordinator;
-    protected final String labelName;
+    protected String labelName;
     protected final DatabaseIf database;
     protected final TableIf table;
     protected final long createTime = System.currentTimeMillis();
@@ -58,18 +58,20 @@ public abstract class AbstractInsertExecutor {
 
     protected String errMsg = "";
     protected Optional<InsertCommandContext> insertCtx;
+    protected final boolean emptyInsert;
 
     /**
      * Constructor
      */
     public AbstractInsertExecutor(ConnectContext ctx, TableIf table, String labelName, NereidsPlanner planner,
-            Optional<InsertCommandContext> insertCtx) {
+            Optional<InsertCommandContext> insertCtx, boolean emptyInsert) {
         this.ctx = ctx;
         this.coordinator = new Coordinator(ctx, null, planner, ctx.getStatsErrorEstimator());
         this.labelName = labelName;
         this.table = table;
         this.database = table.getDatabase();
         this.insertCtx = insertCtx;
+        this.emptyInsert = emptyInsert;
     }
 
     public Coordinator getCoordinator() {
@@ -126,6 +128,7 @@ public abstract class AbstractInsertExecutor {
         executor.getProfile().addExecutionProfile(coordinator.getExecutionProfile());
         QueryInfo queryInfo = new QueryInfo(ConnectContext.get(), executor.getOriginStmtInString(), coordinator);
         QeProcessorImpl.INSTANCE.registerQuery(ctx.queryId(), queryInfo);
+        executor.updateProfile(false);
         coordinator.exec();
         int execTimeout = ctx.getExecTimeout();
         if (LOG.isDebugEnabled()) {
@@ -159,16 +162,14 @@ public abstract class AbstractInsertExecutor {
         }
     }
 
-    private boolean checkStrictMode() {
+    private void checkStrictMode() throws Exception {
         // if in strict mode, insert will fail if there are filtered rows
         if (ctx.getSessionVariable().getEnableInsertStrict()) {
             if (filteredRows > 0) {
-                ctx.getState().setError(ErrorCode.ERR_FAILED_WHEN_INSERT,
-                        "Insert has filtered data in strict mode, tracking_url=" + coordinator.getTrackingUrl());
-                return false;
+                ErrorReport.reportDdlException("Insert has filtered data in strict mode",
+                        ErrorCode.ERR_FAILED_WHEN_INSERT);
             }
         }
-        return true;
     }
 
     /**
@@ -178,9 +179,7 @@ public abstract class AbstractInsertExecutor {
         beforeExec();
         try {
             execImpl(executor, jobId);
-            if (!checkStrictMode()) {
-                return;
-            }
+            checkStrictMode();
             onComplete();
         } catch (Throwable t) {
             onFail(t);
@@ -191,5 +190,9 @@ public abstract class AbstractInsertExecutor {
             QeProcessorImpl.INSTANCE.unregisterQuery(ctx.queryId());
         }
         afterExec(executor);
+    }
+
+    public boolean isEmptyInsert() {
+        return emptyInsert;
     }
 }

@@ -73,8 +73,10 @@
 #include "olap/txn_manager.h"
 #include "olap/utils.h"
 #include "runtime/exec_env.h"
+#include "runtime/memory/global_memory_arbitrator.h"
 #include "runtime/snapshot_loader.h"
 #include "service/backend_options.h"
+#include "util/debug_points.h"
 #include "util/doris_metrics.h"
 #include "util/mem_info.h"
 #include "util/random.h"
@@ -189,6 +191,7 @@ void alter_tablet(StorageEngine& engine, const TAgentTaskRequest& agent_task_req
         new_tablet_id = agent_task_req.alter_tablet_req_v2.new_tablet_id;
         new_schema_hash = agent_task_req.alter_tablet_req_v2.new_schema_hash;
         EngineAlterTabletTask engine_task(agent_task_req.alter_tablet_req_v2);
+        SCOPED_ATTACH_TASK(engine_task.mem_tracker());
         status = engine_task.execute();
     }
 
@@ -1246,6 +1249,7 @@ void push_storage_policy_callback(StorageEngine& engine, const TAgentTaskRequest
             S3Conf s3_conf;
             s3_conf.ak = std::move(resource.s3_storage_param.ak);
             s3_conf.sk = std::move(resource.s3_storage_param.sk);
+            s3_conf.token = std::move(resource.s3_storage_param.token);
             s3_conf.endpoint = std::move(resource.s3_storage_param.endpoint);
             s3_conf.region = std::move(resource.s3_storage_param.region);
             s3_conf.prefix = std::move(resource.s3_storage_param.root_path);
@@ -1258,10 +1262,10 @@ void push_storage_policy_callback(StorageEngine& engine, const TAgentTaskRequest
             s3_conf.use_virtual_addressing = !resource.s3_storage_param.use_path_style;
             std::shared_ptr<io::S3FileSystem> fs;
             if (existed_resource.fs == nullptr) {
-                st = io::S3FileSystem::create(s3_conf, std::to_string(resource.id), &fs);
+                st = io::S3FileSystem::create(s3_conf, std::to_string(resource.id), nullptr, &fs);
             } else {
                 fs = std::static_pointer_cast<io::S3FileSystem>(existed_resource.fs);
-                fs->set_conf(s3_conf);
+                st = fs->set_conf(s3_conf);
             }
             if (!st.ok()) {
                 LOG(WARNING) << "update s3 resource failed: " << st;
@@ -1275,9 +1279,13 @@ void push_storage_policy_callback(StorageEngine& engine, const TAgentTaskRequest
         } else if (resource.__isset.hdfs_storage_param) {
             Status st;
             std::shared_ptr<io::HdfsFileSystem> fs;
+            std::string root_path = resource.hdfs_storage_param.__isset.root_path
+                                            ? resource.hdfs_storage_param.root_path
+                                            : "";
             if (existed_resource.fs == nullptr) {
                 st = io::HdfsFileSystem::create(resource.hdfs_storage_param,
-                                                std::to_string(resource.id), "", nullptr, &fs);
+                                                std::to_string(resource.id), root_path, nullptr,
+                                                &fs);
             } else {
                 fs = std::static_pointer_cast<io::HdfsFileSystem>(existed_resource.fs);
             }
@@ -1286,7 +1294,8 @@ void push_storage_policy_callback(StorageEngine& engine, const TAgentTaskRequest
             } else {
                 LOG_INFO("successfully update hdfs resource")
                         .tag("resource_id", resource.id)
-                        .tag("resource_name", resource.name);
+                        .tag("resource_name", resource.name)
+                        .tag("root_path", fs->root_path().string());
                 put_storage_resource(resource.id, {std::move(fs), resource.version});
             }
         } else {
@@ -1500,6 +1509,7 @@ void PublishVersionWorkerPool::publish_version_callback(const TAgentTaskRequest&
         EnginePublishVersionTask engine_task(publish_version_req, &error_tablet_ids, &succ_tablets,
                                              &discontinuous_version_tablets,
                                              &table_id_to_num_delta_rows);
+        SCOPED_ATTACH_TASK(engine_task.mem_tracker());
         status = engine_task.execute();
         if (status.ok()) {
             break;
@@ -1559,7 +1569,7 @@ void PublishVersionWorkerPool::publish_version_callback(const TAgentTaskRequest&
                 .error(status);
     } else {
         if (!config::disable_auto_compaction &&
-            !MemInfo::is_exceed_soft_mem_limit(GB_EXCHANGE_BYTE)) {
+            !GlobalMemoryArbitrator::is_exceed_soft_mem_limit(GB_EXCHANGE_BYTE)) {
             for (auto [tablet_id, _] : succ_tablets) {
                 TabletSharedPtr tablet = _engine.tablet_manager()->get_tablet(tablet_id);
                 if (tablet != nullptr) {
@@ -1734,6 +1744,7 @@ void storage_medium_migrate_callback(StorageEngine& engine, const TAgentTaskRequ
     auto status = check_migrate_request(engine, storage_medium_migrate_req, tablet, &dest_store);
     if (status.ok()) {
         EngineStorageMigrationTask engine_task(tablet, dest_store);
+        SCOPED_ATTACH_TASK(engine_task.mem_tracker());
         status = engine_task.execute();
     }
     // fe should ignore this err
@@ -1759,6 +1770,14 @@ void storage_medium_migrate_callback(StorageEngine& engine, const TAgentTaskRequ
 
     finish_task(finish_task_request);
     remove_task_info(req.task_type, req.signature);
+}
+
+void clean_trash_callback(StorageEngine& engine, const TAgentTaskRequest& req) {
+    LOG(INFO) << "clean trash start";
+    DBUG_EXECUTE_IF("clean_trash_callback_sleep", { sleep(100); })
+    static_cast<void>(engine.start_trash_sweep(nullptr, true));
+    static_cast<void>(engine.notify_listener("REPORT_DISK_STATE"));
+    LOG(INFO) << "clean trash finish";
 }
 
 } // namespace doris

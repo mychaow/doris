@@ -248,7 +248,7 @@ struct TQueryOptions {
   85: optional bool enable_page_cache = false;
   86: optional i32 analyze_timeout = 43200;
 
-  87: optional bool faster_float_convert = false;
+  87: optional bool faster_float_convert = false; // deprecated
 
   88: optional bool enable_decimal256 = false;
 
@@ -285,6 +285,17 @@ struct TQueryOptions {
   104: optional i64 min_revocable_mem = 0
 
   105: optional i64 spill_streaming_agg_mem_limit = 0;
+
+  // max rows of each sub-queue in DataQueue.
+  106: optional i64 data_queue_max_blocks = 0;
+  108: optional i64 local_exchange_free_blocks_limit;
+  
+  110: optional bool enable_parquet_filter_by_min_max = true
+  111: optional bool enable_orc_filter_by_min_max = true
+
+  112: optional i32 max_column_reader_num = 0
+
+  113: optional bool enable_force_spill = false;
   
   // For cloud, to control if the content would be written into file cache
   1000: optional bool disable_file_cache = false
@@ -548,6 +559,7 @@ struct TFoldConstantParams {
   3: optional bool vec_exec
   4: optional TQueryOptions query_options
   5: optional Types.TUniqueId query_id
+  6: optional bool is_nereids
 }
 
 // TransmitData
@@ -732,6 +744,7 @@ struct TPipelineFragmentParams {
   38: optional i32 total_instances
   39: optional map<i32, i32> shuffle_idx_to_instance_idx
   40: optional bool is_nereids = true;
+  41: optional i64 wal_id
 
   // For cloud
   1000: optional bool is_mow_table;

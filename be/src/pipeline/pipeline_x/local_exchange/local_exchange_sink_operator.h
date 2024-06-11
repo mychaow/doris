@@ -21,7 +21,7 @@
 
 namespace doris::pipeline {
 
-class Exchanger;
+class ExchangerBase;
 class ShuffleExchanger;
 class PassthroughExchanger;
 class BroadcastExchanger;
@@ -37,6 +37,7 @@ public:
     ~LocalExchangeSinkLocalState() override = default;
 
     Status init(RuntimeState* state, LocalSinkStateInfo& info) override;
+    Status open(RuntimeState* state) override;
     Status close(RuntimeState* state, Status exec_status) override;
     std::string debug_string(int indentation_level) const override;
 
@@ -49,7 +50,7 @@ private:
     friend class PassToOneExchanger;
     friend class AdaptivePassthroughExchanger;
 
-    Exchanger* _exchanger = nullptr;
+    ExchangerBase* _exchanger = nullptr;
 
     // Used by shuffle exchanger
     RuntimeProfile::Counter* _compute_hash_value_timer = nullptr;
@@ -113,8 +114,8 @@ public:
                     _shuffle_idx_to_instance_idx[i] = {i, i};
                 }
             }
-            _partitioner.reset(
-                    new vectorized::Crc32HashPartitioner<LocalExchangeChannelIds>(_num_partitions));
+            _partitioner.reset(new vectorized::Crc32HashPartitioner<vectorized::ShuffleChannelIds>(
+                    _num_partitions));
             RETURN_IF_ERROR(_partitioner->init(_texprs));
         } else if (_type == ExchangeType::BUCKET_HASH_SHUFFLE) {
             _partitioner.reset(new vectorized::Crc32HashPartitioner<vectorized::ShuffleChannelIds>(

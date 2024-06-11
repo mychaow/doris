@@ -118,7 +118,7 @@ private:
 
 class Rowset : public std::enable_shared_from_this<Rowset> {
 public:
-    virtual ~Rowset() = default;
+    virtual ~Rowset();
 
     // Open all segment files in this rowset and load necessary metadata.
     // - `use_cache` : whether to use fd cache, only applicable to alpha rowset now
@@ -205,7 +205,7 @@ public:
     // hard link all files in this rowset to `dir` to form a new rowset with id `new_rowset_id`.
     virtual Status link_files_to(const std::string& dir, RowsetId new_rowset_id,
                                  size_t new_rowset_start_seg_id = 0,
-                                 std::set<int32_t>* without_index_uids = nullptr) = 0;
+                                 std::set<int64_t>* without_index_uids = nullptr) = 0;
 
     // copy all files to `dir`
     virtual Status copy_files_to(const std::string& dir, const RowsetId& new_rowset_id) = 0;
@@ -301,6 +301,9 @@ public:
 
     // set skip index compaction next time
     void set_skip_index_compaction(int32_t column_id) { skip_index_compaction.insert(column_id); }
+
+    virtual void clear_inverted_index_cache() { LOG(INFO) << "should not reach here"; }
+    void clear_cache();
 
 protected:
     friend class RowsetFactory;

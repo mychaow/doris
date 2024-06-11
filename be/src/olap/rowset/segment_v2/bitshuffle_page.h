@@ -84,12 +84,12 @@ void warn_with_bitshuffle_error(int64_t val);
 //    The header is followed by the bitshuffle-compressed element data.
 //
 template <FieldType Type>
-class BitshufflePageBuilder : public PageBuilder {
+class BitshufflePageBuilder : public PageBuilderHelper<BitshufflePageBuilder<Type>> {
 public:
-    BitshufflePageBuilder(const PageBuilderOptions& options)
-            : _options(options), _count(0), _remain_element_capacity(0), _finished(false) {
-        reset();
-    }
+    using Self = BitshufflePageBuilder<Type>;
+    friend class PageBuilderHelper<Self>;
+
+    Status init() override { return reset(); }
 
     bool is_page_full() override { return _remain_element_capacity == 0; }
 
@@ -111,7 +111,9 @@ public:
         int to_add = std::min<int>(_remain_element_capacity, *count);
         int to_add_size = to_add * SIZE_OF_TYPE;
         size_t orig_size = _data.size();
-        _data.resize(orig_size + to_add_size);
+        // This may need a large memory, should return error if could not allocated
+        // successfully, to avoid BE OOM.
+        RETURN_IF_CATCH_EXCEPTION(_data.resize(orig_size + to_add_size));
         _count += to_add;
         _remain_element_capacity -= to_add;
         // return added number through count
@@ -147,7 +149,7 @@ public:
         return _finish(SIZE_OF_TYPE);
     }
 
-    void reset() override {
+    Status reset() override {
         auto block_size = _options.data_page_size;
         _count = 0;
         _data.clear();
@@ -158,6 +160,7 @@ public:
         _buffer.resize(BITSHUFFLE_PAGE_HEADER_SIZE);
         _finished = false;
         _remain_element_capacity = block_size / SIZE_OF_TYPE;
+        return Status::OK();
     }
 
     size_t count() const override { return _count; }
@@ -182,6 +185,9 @@ public:
     }
 
 private:
+    BitshufflePageBuilder(const PageBuilderOptions& options)
+            : _options(options), _count(0), _remain_element_capacity(0), _finished(false) {}
+
     OwnedSlice _finish(int final_size_of_type) {
         _data.resize(final_size_of_type * _count);
 

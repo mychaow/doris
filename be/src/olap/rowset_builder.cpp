@@ -48,6 +48,7 @@
 #include "olap/tablet_meta.h"
 #include "olap/tablet_schema.h"
 #include "olap/txn_manager.h"
+#include "runtime/memory/global_memory_arbitrator.h"
 #include "util/brpc_client_cache.h"
 #include "util/mem_info.h"
 #include "util/ref_count_closure.h"
@@ -118,6 +119,7 @@ void RowsetBuilder::_garbage_collection() {
 Status RowsetBuilder::init_mow_context(std::shared_ptr<MowContext>& mow_context) {
     std::lock_guard<std::shared_mutex> lck(tablet()->get_header_lock());
     int64_t cur_max_version = tablet()->max_version_unlocked().second;
+    std::vector<RowsetSharedPtr> rowset_ptrs;
     // tablet is under alter process. The delete bitmap will be calculated after conversion.
     if (tablet()->tablet_state() == TABLET_NOTREADY) {
         // Disable 'partial_update' when the tablet is undergoing a 'schema changing process'
@@ -129,16 +131,17 @@ Status RowsetBuilder::init_mow_context(std::shared_ptr<MowContext>& mow_context)
         _rowset_ids.clear();
     } else {
         RETURN_IF_ERROR(tablet()->all_rs_id(cur_max_version, &_rowset_ids));
+        rowset_ptrs = tablet()->get_rowset_by_ids(&_rowset_ids);
     }
     _delete_bitmap = std::make_shared<DeleteBitmap>(tablet()->tablet_id());
-    mow_context =
-            std::make_shared<MowContext>(cur_max_version, _req.txn_id, _rowset_ids, _delete_bitmap);
+    mow_context = std::make_shared<MowContext>(cur_max_version, _req.txn_id, _rowset_ids,
+                                               rowset_ptrs, _delete_bitmap);
     return Status::OK();
 }
 
 Status RowsetBuilder::check_tablet_version_count() {
     if (!_tablet->exceed_version_limit(config::max_tablet_version_num - 100) ||
-        MemInfo::is_exceed_soft_mem_limit(GB_EXCHANGE_BYTE)) {
+        GlobalMemoryArbitrator::is_exceed_soft_mem_limit(GB_EXCHANGE_BYTE)) {
         return Status::OK();
     }
     //trigger compaction
@@ -161,8 +164,8 @@ Status RowsetBuilder::check_tablet_version_count() {
 }
 
 Status RowsetBuilder::prepare_txn() {
-    std::shared_lock base_migration_lock(tablet()->get_migration_lock(), std::try_to_lock);
-    if (!base_migration_lock.owns_lock()) {
+    std::shared_lock base_migration_lock(tablet()->get_migration_lock(), std::defer_lock);
+    if (!base_migration_lock.try_lock_for(std::chrono::milliseconds(30))) {
         return Status::Error<TRY_LOCK_FAILED>("try migration lock failed");
     }
     std::lock_guard<std::mutex> push_lock(tablet()->get_push_lock());
@@ -252,6 +255,17 @@ Status RowsetBuilder::submit_calc_delete_bitmap_task() {
     // of the delete bitmap. This operation is resource-intensive, and we need to minimize
     // the number of times it occurs. Therefore, we skip this operation here.
     if (_partial_update_info->is_partial_update) {
+        // for partial update, the delete bitmap calculation is done while append_block()
+        // we print it's summarize logs here before commit.
+        LOG(INFO) << fmt::format(
+                "partial update calc delete bitmap summary before commit: tablet({}), txn_id({}), "
+                "rowset_ids({}), cur max_version({}), bitmap num({}), num rows updated({}), num "
+                "rows new added({}), num rows deleted({}), total rows({})",
+                tablet()->tablet_id(), _req.txn_id, _rowset_ids.size(),
+                rowset_writer()->context().mow_context->max_version,
+                _delete_bitmap->delete_bitmap.size(), rowset_writer()->num_rows_updated(),
+                rowset_writer()->num_rows_new_added(), rowset_writer()->num_rows_deleted(),
+                rowset_writer()->num_rows());
         return Status::OK();
     }
 
@@ -374,7 +388,9 @@ void BaseRowsetBuilder::_build_current_tablet_schema(int64_t index_id,
     _partial_update_info = std::make_shared<PartialUpdateInfo>();
     _partial_update_info->init(*_tablet_schema, table_schema_param->is_partial_update(),
                                table_schema_param->partial_update_input_columns(),
-                               table_schema_param->is_strict_mode());
+                               table_schema_param->is_strict_mode(),
+                               table_schema_param->timestamp_ms(), table_schema_param->timezone(),
+                               table_schema_param->auto_increment_coulumn());
 }
 
 } // namespace doris

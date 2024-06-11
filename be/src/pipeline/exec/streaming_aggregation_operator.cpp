@@ -83,15 +83,7 @@ StreamingAggLocalState::StreamingAggLocalState(RuntimeState* state, OperatorXBas
 Status StreamingAggLocalState::init(RuntimeState* state, LocalStateInfo& info) {
     RETURN_IF_ERROR(Base::init(state, info));
     SCOPED_TIMER(Base::exec_time_counter());
-    SCOPED_TIMER(Base::_open_timer);
-    auto& p = Base::_parent->template cast<StreamingAggOperatorX>();
-    for (auto& evaluator : p._aggregate_evaluators) {
-        _aggregate_evaluators.push_back(evaluator->clone(state, p._pool));
-    }
-    _probe_expr_ctxs.resize(p._probe_expr_ctxs.size());
-    for (size_t i = 0; i < _probe_expr_ctxs.size(); i++) {
-        RETURN_IF_ERROR(p._probe_expr_ctxs[i]->clone(state, _probe_expr_ctxs[i]));
-    }
+    SCOPED_TIMER(Base::_init_timer);
     _hash_table_memory_usage = ADD_CHILD_COUNTER_WITH_LEVEL(Base::profile(), "HashTable",
                                                             TUnit::BYTES, "MemoryUsage", 1);
     _serialize_key_arena_memory_usage = Base::profile()->AddHighWaterMarkCounter(
@@ -119,7 +111,23 @@ Status StreamingAggLocalState::init(RuntimeState* state, LocalStateInfo& info) {
     _serialize_result_timer = ADD_TIMER(profile(), "SerializeResultTime");
     _hash_table_iterate_timer = ADD_TIMER(profile(), "HashTableIterateTime");
     _insert_keys_to_column_timer = ADD_TIMER(profile(), "InsertKeysToColumnTime");
-    COUNTER_SET(_max_row_size_counter, (int64_t)0);
+
+    return Status::OK();
+}
+
+Status StreamingAggLocalState::open(RuntimeState* state) {
+    SCOPED_TIMER(Base::exec_time_counter());
+    SCOPED_TIMER(Base::_open_timer);
+    RETURN_IF_ERROR(Base::open(state));
+
+    auto& p = Base::_parent->template cast<StreamingAggOperatorX>();
+    for (auto& evaluator : p._aggregate_evaluators) {
+        _aggregate_evaluators.push_back(evaluator->clone(state, p._pool));
+    }
+    _probe_expr_ctxs.resize(p._probe_expr_ctxs.size());
+    for (size_t i = 0; i < _probe_expr_ctxs.size(); i++) {
+        RETURN_IF_ERROR(p._probe_expr_ctxs[i]->clone(state, _probe_expr_ctxs[i]));
+    }
 
     for (auto& evaluator : _aggregate_evaluators) {
         evaluator->set_timer(_merge_timer, _expr_timer);
@@ -176,7 +184,7 @@ Status StreamingAggLocalState::init(RuntimeState* state, LocalStateInfo& info) {
                                (!p._have_conjuncts) && // no having conjunct
                                p._needs_finalize;      // agg's finalize step
     }
-    _init = true;
+    _opened = true;
     return Status::OK();
 }
 
@@ -247,8 +255,7 @@ Status StreamingAggLocalState::_merge_with_serialized_key_helper(vectorized::Blo
                             _places.data(),
                             Base::_parent->template cast<StreamingAggOperatorX>()
                                     ._offsets_of_aggregate_states[i],
-                            _deserialize_buffer.data(), (vectorized::ColumnString*)(column.get()),
-                            _agg_arena_pool.get(), rows);
+                            _deserialize_buffer.data(), column.get(), _agg_arena_pool.get(), rows);
                 }
             } else {
                 RETURN_IF_ERROR(_aggregate_evaluators[i]->execute_batch_add_selected(
@@ -285,8 +292,7 @@ Status StreamingAggLocalState::_merge_with_serialized_key_helper(vectorized::Blo
                             _places.data(),
                             Base::_parent->template cast<StreamingAggOperatorX>()
                                     ._offsets_of_aggregate_states[i],
-                            _deserialize_buffer.data(), (vectorized::ColumnString*)(column.get()),
-                            _agg_arena_pool.get(), rows);
+                            _deserialize_buffer.data(), column.get(), _agg_arena_pool.get(), rows);
                 }
             } else {
                 RETURN_IF_ERROR(_aggregate_evaluators[i]->execute_batch_add(
@@ -1137,7 +1143,8 @@ StreamingAggOperatorX::StreamingAggOperatorX(ObjectPool* pool, int operator_id,
           _needs_finalize(tnode.agg_node.need_finalize),
           _is_merge(false),
           _is_first_phase(tnode.agg_node.__isset.is_first_phase && tnode.agg_node.is_first_phase),
-          _have_conjuncts(tnode.__isset.vconjunct && !tnode.vconjunct.nodes.empty()) {}
+          _have_conjuncts(tnode.__isset.vconjunct && !tnode.vconjunct.nodes.empty()),
+          _agg_fn_output_row_descriptor(descs, tnode.row_tuples, tnode.nullable_tuples) {}
 
 Status StreamingAggOperatorX::init(const TPlanNode& tnode, RuntimeState* state) {
     RETURN_IF_ERROR(StatefulOperatorX<StreamingAggLocalState>::init(tnode, state));
@@ -1227,7 +1234,11 @@ Status StreamingAggOperatorX::prepare(RuntimeState* state) {
                     alignment_of_next_state * alignment_of_next_state;
         }
     }
-
+    // check output type
+    if (_needs_finalize) {
+        RETURN_IF_ERROR(vectorized::AggFnEvaluator::check_agg_fn_output(
+                _probe_expr_ctxs.size(), _aggregate_evaluators, _agg_fn_output_row_descriptor));
+    }
     return Status::OK();
 }
 
@@ -1244,7 +1255,7 @@ Status StreamingAggOperatorX::open(RuntimeState* state) {
 }
 
 Status StreamingAggLocalState::close(RuntimeState* state) {
-    if (_closed) {
+    if (!_opened || _closed) {
         return Status::OK();
     }
     SCOPED_TIMER(Base::exec_time_counter());

@@ -48,6 +48,8 @@ import org.apache.doris.common.util.DebugUtil;
 import org.apache.doris.common.util.InternalDatabaseUtil;
 import org.apache.doris.common.util.MetaLockUtils;
 import org.apache.doris.common.util.TimeUtils;
+import org.apache.doris.datasource.InternalCatalog;
+import org.apache.doris.event.DataChangeEvent;
 import org.apache.doris.metric.MetricRepo;
 import org.apache.doris.mysql.privilege.PrivPredicate;
 import org.apache.doris.persist.BatchRemoveTransactionsOperationV2;
@@ -169,8 +171,6 @@ public class DatabaseTransactionMgr {
 
     private long lockReportingThresholdMs = Config.lock_reporting_threshold_ms;
 
-    private long maxFinalTxnsNum = Long.MAX_VALUE;
-
     private void readLock() {
         this.transactionLock.readLock().lock();
     }
@@ -194,9 +194,6 @@ public class DatabaseTransactionMgr {
         this.env = env;
         this.idGenerator = idGenerator;
         this.editLog = env.getEditLog();
-        if (Config.label_num_threshold >= 0) {
-            this.maxFinalTxnsNum = Config.label_num_threshold;
-        }
     }
 
     public long getDbId() {
@@ -1056,6 +1053,17 @@ public class DatabaseTransactionMgr {
         } finally {
             MetaLockUtils.writeUnlockTables(tableList);
         }
+        // Here, we only wait for the EventProcessor to finish processing the event,
+        // but regardless of the success or failure of the result,
+        // it does not affect the logic of transaction
+        try {
+            produceEvent(transactionState, db);
+        } catch (Throwable t) {
+            // According to normal logic, no exceptions will be thrown,
+            // but in order to avoid bugs affecting the original logic, all exceptions are caught
+            LOG.warn("produceEvent failed: ", t);
+        }
+
         // The visible latch should only be counted down after all things are done
         // (finish transaction, write edit log, etc).
         // Otherwise, there is no way for stream load to query the result right after loading finished,
@@ -1076,6 +1084,21 @@ public class DatabaseTransactionMgr {
             }
             entry.getValue().setVersion(table.getNextVersion());
             entry.getValue().setVersionTime(System.currentTimeMillis());
+        }
+    }
+
+    private void produceEvent(TransactionState transactionState, Database db) {
+        Collection<TableCommitInfo> tableCommitInfos = transactionState.getIdToTableCommitInfos().values();
+        for (TableCommitInfo tableCommitInfo : tableCommitInfos) {
+            long tableId = tableCommitInfo.getTableId();
+            OlapTable table = (OlapTable) db.getTableNullable(tableId);
+            if (table == null) {
+                LOG.warn("table {} does not exist when produceEvent. transaction: {}, db: {}",
+                        tableId, transactionState.getTransactionId(), db.getId());
+                continue;
+            }
+            Env.getCurrentEnv().getEventProcessor().processEvent(
+                    new DataChangeEvent(db.getCatalog().getId(), db.getId(), tableId));
         }
     }
 
@@ -1340,7 +1363,8 @@ public class DatabaseTransactionMgr {
                         || tblPartitionInfo.getType() == PartitionType.LIST) {
                     partitionRange = tblPartitionInfo.getItem(partitionId).getItems().toString();
                 }
-                PartitionCommitInfo partitionCommitInfo = new PartitionCommitInfo(partitionId, partitionRange, -1, -1);
+                PartitionCommitInfo partitionCommitInfo = new PartitionCommitInfo(partitionId, partitionRange, -1, -1,
+                        table.isTemporaryPartition(partitionId));
                 tableCommitInfo.addPartitionCommitInfo(partitionCommitInfo);
             }
             transactionState.putIdToTableCommitInfo(tableId, tableCommitInfo);
@@ -1383,7 +1407,8 @@ public class DatabaseTransactionMgr {
                 }
                 PartitionCommitInfo partitionCommitInfo = new PartitionCommitInfo(partitionId, partitionRange,
                         partition.getNextVersion(),
-                        System.currentTimeMillis() /* use as partition visible time */);
+                        System.currentTimeMillis() /* use as partition visible time */,
+                        table.isTemporaryPartition(partitionId));
                 tableCommitInfo.addPartitionCommitInfo(partitionCommitInfo);
             }
             transactionState.putIdToTableCommitInfo(tableId, tableCommitInfo);
@@ -1727,7 +1752,7 @@ public class DatabaseTransactionMgr {
                 break;
             }
         }
-        while (finalStatusTransactionStateDeque.size() > maxFinalTxnsNum
+        while ((Config.label_num_threshold > 0 && finalStatusTransactionStateDeque.size() > Config.label_num_threshold)
                 && numOfClearedTransaction < left) {
             TransactionState transactionState = finalStatusTransactionStateDeque.getFirst();
             if (transactionState.getFinishTime() != -1) {
@@ -1835,8 +1860,10 @@ public class DatabaseTransactionMgr {
                 for (Long tblId : tblIds) {
                     Table tbl = db.getTableNullable(tblId);
                     if (tbl != null) {
-                        if (!Env.getCurrentEnv().getAccessManager().checkTblPriv(ConnectContext.get(), db.getFullName(),
-                                tbl.getName(), PrivPredicate.SHOW)) {
+                        if (!Env.getCurrentEnv().getAccessManager()
+                                .checkTblPriv(ConnectContext.get(), InternalCatalog.INTERNAL_CATALOG_NAME,
+                                        db.getFullName(),
+                                        tbl.getName(), PrivPredicate.SHOW)) {
                             ErrorReport.reportAnalysisException(ErrorCode.ERR_TABLEACCESS_DENIED_ERROR,
                                     "SHOW TRANSACTION",
                                     ConnectContext.get().getQualifiedUser(),

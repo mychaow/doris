@@ -167,7 +167,7 @@ public class EditLog {
         short opCode = journal.getOpCode();
         if (opCode != OperationType.OP_SAVE_NEXTID && opCode != OperationType.OP_TIMESTAMP) {
             if (LOG.isDebugEnabled()) {
-                LOG.debug("replay journal op code: {}", opCode);
+                LOG.debug("replay journal op code: {}, log id: {}", opCode, logId);
             }
         }
         try {
@@ -438,8 +438,7 @@ public class EditLog {
                     Frontend fe = (Frontend) journal.getData();
                     env.replayDropFrontend(fe);
                     if (fe.getNodeName().equals(Env.getCurrentEnv().getNodeName())) {
-                        System.out.println("current fe " + fe + " is removed. will exit");
-                        LOG.info("current fe " + fe + " is removed. will exit");
+                        LOG.warn("current fe {} is removed. will exit", fe);
                         System.exit(-1);
                     }
                     break;
@@ -948,7 +947,7 @@ public class EditLog {
                 }
                 case OperationType.OP_REFRESH_CATALOG: {
                     CatalogLog log = (CatalogLog) journal.getData();
-                    env.getCatalogMgr().replayRefreshCatalog(log);
+                    env.getRefreshManager().replayRefreshCatalog(log);
                     break;
                 }
                 case OperationType.OP_MODIFY_TABLE_LIGHT_SCHEMA_CHANGE: {
@@ -1014,7 +1013,7 @@ public class EditLog {
                 }
                 case OperationType.OP_REFRESH_EXTERNAL_DB: {
                     final ExternalObjectLog log = (ExternalObjectLog) journal.getData();
-                    env.getCatalogMgr().replayRefreshExternalDb(log);
+                    env.getRefreshManager().replayRefreshDb(log);
                     break;
                 }
                 case OperationType.OP_INIT_EXTERNAL_DB: {
@@ -1024,7 +1023,7 @@ public class EditLog {
                 }
                 case OperationType.OP_REFRESH_EXTERNAL_TABLE: {
                     final ExternalObjectLog log = (ExternalObjectLog) journal.getData();
-                    env.getCatalogMgr().replayRefreshExternalTable(log);
+                    env.getRefreshManager().replayRefreshTable(log);
                     break;
                 }
                 case OperationType.OP_DROP_EXTERNAL_TABLE: {
@@ -1202,7 +1201,7 @@ public class EditLog {
                 }
                 default: {
                     IOException e = new IOException();
-                    LOG.error("UNKNOWN Operation Type {}", opCode, e);
+                    LOG.error("UNKNOWN Operation Type {}, log id: {}", opCode, logId, e);
                     throw e;
                 }
             }
@@ -1226,9 +1225,9 @@ public class EditLog {
              * log a warning here to debug when happens. This could happen to other meta
              * like DB.
              */
-            LOG.warn("[INCONSISTENT META] replay failed {}: {}", journal, e.getMessage(), e);
+            LOG.warn("[INCONSISTENT META] replay log {} failed, journal {}: {}", logId, journal, e.getMessage(), e);
         } catch (Exception e) {
-            LOG.error("Operation Type {}", opCode, e);
+            LOG.error("replay Operation Type {}, log id: {}", opCode, logId, e);
             System.exit(-1);
         }
     }

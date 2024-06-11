@@ -25,15 +25,18 @@
 #include <algorithm>
 #include <array>
 #include <boost/iterator/iterator_facade.hpp>
+#include <cmath>
 #include <cstddef>
 #include <cstdlib>
 #include <iomanip>
+#include <limits>
 #include <memory>
 #include <ostream>
 #include <random>
 #include <sstream>
 #include <stdexcept>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -65,6 +68,7 @@
 #include "vec/core/field.h"
 #include "vec/core/types.h"
 #include "vec/data_types/data_type.h"
+#include "vec/functions/round.h"
 #include "vec/io/io_helper.h"
 
 #ifndef USE_LIBCPP
@@ -290,6 +294,68 @@ private:
             size_t fixed_len = std::min(str_size - fixed_pos, len_value);
             StringOP::push_value_string_reserved_and_allow_overflow(
                     {str_data + fixed_pos, fixed_len}, i, res_chars, res_offsets);
+        }
+    }
+};
+
+class FunctionStrcmp : public IFunction {
+public:
+    static constexpr auto name = "strcmp";
+
+    static FunctionPtr create() { return std::make_shared<FunctionStrcmp>(); }
+
+    String get_name() const override { return name; }
+
+    size_t get_number_of_arguments() const override { return 2; }
+
+    DataTypePtr get_return_type_impl(const DataTypes& arguments) const override {
+        return std::make_shared<DataTypeInt8>();
+    }
+
+    Status execute_impl(FunctionContext* context, Block& block, const ColumnNumbers& arguments,
+                        size_t result, size_t input_rows_count) const override {
+        const auto& [arg0_column, arg0_const] =
+                unpack_if_const(block.get_by_position(arguments[0]).column);
+        const auto& [arg1_column, arg1_const] =
+                unpack_if_const(block.get_by_position(arguments[1]).column);
+
+        auto result_column = ColumnInt8::create(input_rows_count);
+
+        if (auto arg0 = check_and_get_column<ColumnString>(arg0_column.get())) {
+            if (auto arg1 = check_and_get_column<ColumnString>(arg1_column.get())) {
+                if (arg0_const) {
+                    scalar_vector(arg0->get_data_at(0), *arg1, *result_column);
+                } else if (arg1_const) {
+                    vector_scalar(*arg0, arg1->get_data_at(0), *result_column);
+                } else {
+                    vector_vector(*arg0, *arg1, *result_column);
+                }
+            }
+        }
+
+        block.replace_by_position(result, std::move(result_column));
+        return Status::OK();
+    }
+
+private:
+    static void scalar_vector(const StringRef str, const ColumnString& vec1, ColumnInt8& res) {
+        size_t size = vec1.size();
+        for (size_t i = 0; i < size; ++i) {
+            res.get_data()[i] = str.compare(vec1.get_data_at(i));
+        }
+    }
+
+    static void vector_scalar(const ColumnString& vec0, const StringRef str, ColumnInt8& res) {
+        size_t size = vec0.size();
+        for (size_t i = 0; i < size; ++i) {
+            res.get_data()[i] = vec0.get_data_at(i).compare(str);
+        }
+    }
+
+    static void vector_vector(const ColumnString& vec0, const ColumnString& vec1, ColumnInt8& res) {
+        size_t size = vec0.size();
+        for (size_t i = 0; i < size; ++i) {
+            res.get_data()[i] = vec0.get_data_at(i).compare(vec1.get_data_at(i));
         }
     }
 };
@@ -726,10 +792,7 @@ public:
 
     Status execute_impl(FunctionContext* context, Block& block, const ColumnNumbers& arguments,
                         size_t result, size_t input_rows_count) const override {
-        DCHECK_GE(arguments.size(), 1);
-        DCHECK_LE(arguments.size(), 2);
-
-        int n = -1;
+        int n = -1; // means unassigned
 
         auto res = ColumnString::create();
         auto col = block.get_by_position(arguments[0]).column->convert_to_full_column_if_const();
@@ -737,17 +800,20 @@ public:
 
         if (arguments.size() == 2) {
             const auto& col = *block.get_by_position(arguments[1]).column;
+            // the 2nd arg is const. checked in fe.
+            if (col.get_int(0) < 0) [[unlikely]] {
+                return Status::InvalidArgument(
+                        "function {} only accept non-negative input for 2nd argument but got {}",
+                        name, col.get_int(0));
+            }
             n = col.get_int(0);
-        } else if (arguments.size() > 2) {
-            return Status::InvalidArgument(
-                    fmt::format("too many arguments for function {}", get_name()));
         }
 
-        if (n == -1) {
+        if (n == -1) { // no 2nd arg, just mask all
             FunctionMask::vector_mask(source_column, *res, FunctionMask::DEFAULT_UPPER_MASK,
                                       FunctionMask::DEFAULT_LOWER_MASK,
                                       FunctionMask::DEFAULT_NUMBER_MASK);
-        } else if (n >= 0) {
+        } else { // n >= 0
             vector(source_column, n, *res);
         }
 
@@ -1648,9 +1714,17 @@ public:
                                                 res_chars, res_offsets);
                     continue;
                 }
+                if (col_len_data[i] > context->state()->repeat_max_num()) {
+                    return Status::InvalidArgument(
+                            " {} function the length argument is {} exceeded maximum default "
+                            "value: {}."
+                            "if you really need this length, you could change the session variable "
+                            "set repeat_max_num = xxx.",
+                            get_name(), col_len_data[i], context->state()->repeat_max_num());
+                }
+
+                // make compatible with mysql. return empty string if pad is empty
                 if (pad_char_size == 0) {
-                    // return NULL when the string to be paded is missing
-                    null_map_data[i] = true;
                     StringOP::push_empty_string(i, res_chars, res_offsets);
                     continue;
                 }
@@ -2827,19 +2901,18 @@ public:
 
         ColumnPtr argument_column =
                 block.get_by_position(arguments[0]).column->convert_to_full_column_if_const();
-        const auto* length_col = check_and_get_column<ColumnInt32>(argument_column.get());
-
-        if (!length_col) {
-            return Status::InternalError("Not supported input argument type");
-        }
+        const auto* length_col = assert_cast<const ColumnInt32*>(argument_column.get());
 
         std::vector<uint8_t> random_bytes;
         std::random_device rd;
         std::mt19937 gen(rd());
 
         for (size_t i = 0; i < input_rows_count; ++i) {
-            UInt64 length = length_col->get64(i);
-            random_bytes.resize(length);
+            if (length_col->get_element(i) < 0) [[unlikely]] {
+                return Status::InvalidArgument("argument {} of function {} at row {} was invalid.",
+                                               length_col->get_element(i), name, i);
+            }
+            random_bytes.resize(length_col->get_element(i));
 
             std::uniform_int_distribution<uint8_t> distribution(0, 255);
             for (auto& byte : random_bytes) {
@@ -2897,18 +2970,97 @@ public:
 
 namespace MoneyFormat {
 
+constexpr size_t MAX_FORMAT_LEN_DEC32() {
+    // Decimal(9, 0)
+    // Double the size to avoid some unexpected bug.
+    return 2 * (1 + 9 + (9 / 3) + 3);
+}
+
+constexpr size_t MAX_FORMAT_LEN_DEC64() {
+    // Decimal(18, 0)
+    // Double the size to avoid some unexpected bug.
+    return 2 * (1 + 18 + (18 / 3) + 3);
+}
+
+constexpr size_t MAX_FORMAT_LEN_DEC128V2() {
+    // DecimalV2 has at most 27 digits
+    // Double the size to avoid some unexpected bug.
+    return 2 * (1 + 27 + (27 / 3) + 3);
+}
+
+constexpr size_t MAX_FORMAT_LEN_DEC128V3() {
+    // Decimal(38, 0)
+    // Double the size to avoid some unexpected bug.
+    return 2 * (1 + 39 + (39 / 3) + 3);
+}
+
+constexpr size_t MAX_FORMAT_LEN_INT64() {
+    // INT_MIN = -9223372036854775807
+    // Double the size to avoid some unexpected bug.
+    return 2 * (1 + 20 + (20 / 3) + 3);
+}
+
+constexpr size_t MAX_FORMAT_LEN_INT128() {
+    // INT128_MIN = -170141183460469231731687303715884105728
+    return 2 * (1 + 39 + (39 / 3) + 3);
+}
+
 template <typename T, size_t N>
-StringRef do_money_format(FunctionContext* context, const T int_value,
-                          const int32_t frac_value = 0) {
+StringRef do_money_format(FunctionContext* context, UInt32 scale, T int_value, T frac_value) {
+    static_assert(std::is_integral<T>::value);
+    const bool is_negative = int_value < 0 || frac_value < 0;
+
+    // do round to frac_part
+    // magic number 2: since we need to round frac_part to 2 digits
+    if (scale > 2) {
+        DCHECK(scale <= 38);
+        // do rounding, so we need to reserve 3 digits.
+        auto multiplier = common::exp10_i128(std::abs(static_cast<int>(scale - 3)));
+        // do devide first to avoid overflow
+        // after round frac_value will be positive by design.
+        frac_value = std::abs(frac_value / multiplier) + 5;
+        frac_value /= 10;
+    } else if (scale < 2) {
+        DCHECK(frac_value < 100);
+        // since scale <= 2, overflow is impossiable
+        frac_value = frac_value * common::exp10_i32(2 - scale);
+    }
+
+    if (frac_value == 100) {
+        if (is_negative) {
+            int_value -= 1;
+        } else {
+            int_value += 1;
+        }
+        frac_value = 0;
+    }
+
+    bool append_sign_manually = false;
+    if (is_negative && int_value == 0) {
+        // when int_value is 0, result of SimpleItoaWithCommas will contains just zero
+        // for Decimal like -0.1234, this will leads to problem, because negative sign is discarded.
+        // this is why we introduce argument append_sing_manually.
+        append_sign_manually = true;
+    }
+
     char local[N];
     char* p = SimpleItoaWithCommas(int_value, local, sizeof(local));
-    int32_t string_val_len = local + sizeof(local) - p + 3;
-    StringRef result = context->create_temp_string_val(string_val_len);
+    const Int32 integer_str_len = N - (p - local);
+    const Int32 frac_str_len = 2;
+    const Int32 whole_decimal_str_len =
+            (append_sign_manually ? 1 : 0) + integer_str_len + 1 + frac_str_len;
+
+    StringRef result = context->create_temp_string_val(whole_decimal_str_len);
     char* result_data = const_cast<char*>(result.data);
-    memcpy(result_data, p, string_val_len - 3);
-    *(result_data + string_val_len - 3) = '.';
-    *(result_data + string_val_len - 2) = '0' + (frac_value / 10);
-    *(result_data + string_val_len - 1) = '0' + (frac_value % 10);
+
+    if (append_sign_manually) {
+        memset(result_data, '-', 1);
+    }
+
+    memcpy(result_data + (append_sign_manually ? 1 : 0), p, integer_str_len);
+    *(result_data + whole_decimal_str_len - 3) = '.';
+    *(result_data + whole_decimal_str_len - 2) = '0' + std::abs(frac_value / 10);
+    *(result_data + whole_decimal_str_len - 1) = '0' + std::abs(frac_value % 10);
     return result;
 };
 
@@ -2948,9 +3100,9 @@ struct MoneyFormatDoubleImpl {
         const auto* data_column = assert_cast<const ColumnVector<Float64>*>(col_ptr.get());
         // when scale is above 38, we will go here
         for (size_t i = 0; i < input_rows_count; i++) {
-            // truncate to 2 decimal places, keep same with mysql
+            // round to 2 decimal places
             double value =
-                    MathFunctions::my_double_round(data_column->get_element(i), 2, false, true);
+                    MathFunctions::my_double_round(data_column->get_element(i), 2, false, false);
             StringRef str = MoneyFormat::do_money_format(context, fmt::format("{:.2f}", value));
             result_column->insert_data(str.data, str.size);
         }
@@ -2965,7 +3117,9 @@ struct MoneyFormatInt64Impl {
         const auto* data_column = assert_cast<const ColumnVector<Int64>*>(col_ptr.get());
         for (size_t i = 0; i < input_rows_count; i++) {
             Int64 value = data_column->get_element(i);
-            StringRef str = MoneyFormat::do_money_format<Int64, 26>(context, value);
+            StringRef str =
+                    MoneyFormat::do_money_format<Int64, MoneyFormat::MAX_FORMAT_LEN_INT64()>(
+                            context, 0, value, 0);
             result_column->insert_data(str.data, str.size);
         }
     }
@@ -2977,9 +3131,14 @@ struct MoneyFormatInt128Impl {
     static void execute(FunctionContext* context, ColumnString* result_column,
                         const ColumnPtr col_ptr, size_t input_rows_count) {
         const auto* data_column = assert_cast<const ColumnVector<Int128>*>(col_ptr.get());
+        // SELECT money_format(170141183460469231731687303715884105728/*INT128_MAX + 1*/) will
+        // get "170,141,183,460,469,231,731,687,303,715,884,105,727.00" in doris,
+        // see https://github.com/apache/doris/blob/788abf2d7c3c7c2d57487a9608e889e7662d5fb2/be/src/vec/data_types/data_type_number_base.cpp#L124
         for (size_t i = 0; i < input_rows_count; i++) {
             Int128 value = data_column->get_element(i);
-            StringRef str = MoneyFormat::do_money_format<Int128, 52>(context, value);
+            StringRef str =
+                    MoneyFormat::do_money_format<Int128, MoneyFormat::MAX_FORMAT_LEN_INT128()>(
+                            context, 0, value, 0);
             result_column->insert_data(str.data, str.size);
         }
     }
@@ -2994,70 +3153,54 @@ struct MoneyFormatDecimalImpl {
                         size_t input_rows_count) {
         if (auto* decimalv2_column = check_and_get_column<ColumnDecimal<Decimal128V2>>(*col_ptr)) {
             for (size_t i = 0; i < input_rows_count; i++) {
-                DecimalV2Value value = DecimalV2Value(decimalv2_column->get_element(i));
-
-                DecimalV2Value rounded(0);
-                value.round(&rounded, 2, HALF_UP);
-
-                StringRef str = MoneyFormat::do_money_format<int64_t, 26>(
-                        context, rounded.int_value(), abs(rounded.frac_value() / 10000000));
+                const Decimal128V2& dec128 = decimalv2_column->get_element(i);
+                DecimalV2Value value = DecimalV2Value(dec128.value);
+                // unified_frac_value has 3 digits
+                auto unified_frac_value = value.frac_value() / 1000000;
+                StringRef str =
+                        MoneyFormat::do_money_format<Int128,
+                                                     MoneyFormat::MAX_FORMAT_LEN_DEC128V2()>(
+                                context, 3, value.int_value(), unified_frac_value);
 
                 result_column->insert_data(str.data, str.size);
             }
         } else if (auto* decimal32_column =
                            check_and_get_column<ColumnDecimal<Decimal32>>(*col_ptr)) {
             const UInt32 scale = decimal32_column->get_scale();
-            // scale is up to 9, so exp10_i32 is enough
-            const auto multiplier = common::exp10_i32(std::abs(static_cast<int>(scale - 2)));
             for (size_t i = 0; i < input_rows_count; i++) {
-                Decimal32 frac_part = decimal32_column->get_fractional_part(i);
-                if (scale > 2) {
-                    int delta = ((frac_part % multiplier) << 1) > multiplier;
-                    frac_part = frac_part / multiplier + delta;
-                } else if (scale < 2) {
-                    frac_part = frac_part * multiplier;
-                }
-
-                StringRef str = MoneyFormat::do_money_format<int64_t, 26>(
-                        context, decimal32_column->get_whole_part(i), frac_part);
+                const Decimal32& frac_part = decimal32_column->get_fractional_part(i);
+                const Decimal32& whole_part = decimal32_column->get_whole_part(i);
+                StringRef str =
+                        MoneyFormat::do_money_format<Int64, MoneyFormat::MAX_FORMAT_LEN_DEC32()>(
+                                context, scale, static_cast<Int64>(whole_part.value),
+                                static_cast<Int64>(frac_part.value));
 
                 result_column->insert_data(str.data, str.size);
             }
         } else if (auto* decimal64_column =
                            check_and_get_column<ColumnDecimal<Decimal64>>(*col_ptr)) {
             const UInt32 scale = decimal64_column->get_scale();
-            // 9 < scale <= 18
-            const auto multiplier = common::exp10_i64(std::abs(static_cast<int>(scale - 2)));
             for (size_t i = 0; i < input_rows_count; i++) {
-                Decimal64 frac_part = decimal64_column->get_fractional_part(i);
-                if (scale > 2) {
-                    int delta = ((frac_part % multiplier) << 1) > multiplier;
-                    frac_part = frac_part / multiplier + delta;
-                } else if (scale < 2) {
-                    frac_part = frac_part * multiplier;
-                }
+                const Decimal64& frac_part = decimal64_column->get_fractional_part(i);
+                const Decimal64& whole_part = decimal64_column->get_whole_part(i);
 
-                StringRef str = MoneyFormat::do_money_format<int64_t, 26>(
-                        context, decimal64_column->get_whole_part(i), frac_part);
+                StringRef str =
+                        MoneyFormat::do_money_format<Int64, MoneyFormat::MAX_FORMAT_LEN_DEC64()>(
+                                context, scale, whole_part.value, frac_part.value);
 
                 result_column->insert_data(str.data, str.size);
             }
         } else if (auto* decimal128_column =
                            check_and_get_column<ColumnDecimal<Decimal128V3>>(*col_ptr)) {
             const UInt32 scale = decimal128_column->get_scale();
-            // 18 < scale <= 38
-            const auto multiplier = common::exp10_i128(std::abs(static_cast<int>(scale - 2)));
             for (size_t i = 0; i < input_rows_count; i++) {
-                Decimal128V3 frac_part = decimal128_column->get_fractional_part(i);
-                if (scale > 2) {
-                    int delta = ((frac_part % multiplier) << 1) > multiplier;
-                    frac_part = frac_part / multiplier + delta;
-                } else if (scale < 2) {
-                    frac_part = frac_part * multiplier;
-                }
+                const Decimal128V3& frac_part = decimal128_column->get_fractional_part(i);
+                const Decimal128V3& whole_part = decimal128_column->get_whole_part(i);
 
-                StringRef str = MoneyFormat::do_money_format<__int128, 53>(
-                        context, decimal128_column->get_whole_part(i), frac_part);
+                StringRef str =
+                        MoneyFormat::do_money_format<Int128,
+                                                     MoneyFormat::MAX_FORMAT_LEN_DEC128V3()>(
+                                context, scale, whole_part.value, frac_part.value);
 
                 result_column->insert_data(str.data, str.size);
             }

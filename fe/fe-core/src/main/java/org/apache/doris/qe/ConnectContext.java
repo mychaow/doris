@@ -216,7 +216,7 @@ public class ConnectContext {
 
     private StatsErrorEstimator statsErrorEstimator;
 
-    private Map<String, String> resultAttachedInfo;
+    private Map<String, String> resultAttachedInfo = Maps.newHashMap();
 
     private String workloadGroupName = "";
     private Map<Long, Backend> insertGroupCommitTableToBeMap = new HashMap<>();
@@ -402,14 +402,11 @@ public class ConnectContext {
 
     public void closeTxn() {
         if (isTxnModel()) {
-            if (isTxnBegin()) {
-                try {
-                    InsertStreamTxnExecutor executor = new InsertStreamTxnExecutor(getTxnEntry());
-                    executor.abortTransaction();
-                } catch (Exception e) {
-                    LOG.error("db: {}, txnId: {}, rollback error.", currentDb,
-                            txnEntry.getTxnConf().getTxnId(), e);
-                }
+            try {
+                txnEntry.abortTransaction();
+            } catch (Exception e) {
+                LOG.error("db: {}, txnId: {}, rollback error.", currentDb,
+                        txnEntry.getTransactionId(), e);
             }
             txnEntry = null;
         }
@@ -578,7 +575,7 @@ public class ConnectContext {
 
     // for USER() function
     public UserIdentity getUserIdentity() {
-        return new UserIdentity(qualifiedUser, remoteIP);
+        return UserIdentity.createAnalyzedUserIdentWithIp(qualifiedUser, remoteIP);
     }
 
     public UserIdentity getCurrentUserIdentity() {
@@ -1127,5 +1124,13 @@ public class ConnectContext {
 
     public void setGroupCommitStreamLoadSql(boolean groupCommitStreamLoadSql) {
         isGroupCommitStreamLoadSql = groupCommitStreamLoadSql;
+    }
+
+    public Map<String, LiteralExpr> getUserVars() {
+        return userVars;
+    }
+
+    public void setUserVars(Map<String, LiteralExpr> userVars) {
+        this.userVars = userVars;
     }
 }

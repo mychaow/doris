@@ -35,6 +35,7 @@ import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.datasource.CatalogIf;
 import org.apache.doris.datasource.CatalogMgr;
+import org.apache.doris.datasource.ExternalCatalog;
 import org.apache.doris.policy.Policy;
 import org.apache.doris.policy.StoragePolicy;
 import org.apache.doris.resource.Tag;
@@ -243,11 +244,9 @@ public class PropertyAnalyzer {
             } else if (key.equalsIgnoreCase(PROPERTIES_STORAGE_COOLDOWN_TIME)) {
                 DateLiteral dateLiteral = new DateLiteral(value, ScalarType.getDefaultDateType(Type.DATETIME));
                 cooldownTimestamp = dateLiteral.unixTimestamp(TimeUtils.getTimeZone());
-            } else if (!hasStoragePolicy && key.equalsIgnoreCase(PROPERTIES_STORAGE_POLICY)) {
-                if (!Strings.isNullOrEmpty(value)) {
-                    hasStoragePolicy = true;
-                    newStoragePolicy = value;
-                }
+            } else if (key.equalsIgnoreCase(PROPERTIES_STORAGE_POLICY)) {
+                hasStoragePolicy = true;
+                newStoragePolicy = value;
             }
         } // end for properties
 
@@ -276,7 +275,7 @@ public class PropertyAnalyzer {
             cooldownTimestamp = DataProperty.MAX_COOLDOWN_TIME_MS;
         }
 
-        if (hasStoragePolicy) {
+        if (hasStoragePolicy && !"".equals(newStoragePolicy)) {
             // check remote storage policy
             StoragePolicy checkedPolicy = StoragePolicy.ofCheck(newStoragePolicy);
             Policy policy = Env.getCurrentEnv().getPolicyMgr().getPolicy(checkedPolicy);
@@ -704,7 +703,8 @@ public class PropertyAnalyzer {
         }
         properties.remove(PROPERTIES_SKIP_WRITE_INDEX_ON_LOAD);
         if (value.equalsIgnoreCase("true")) {
-            return true;
+            throw new AnalysisException("Property " + PROPERTIES_SKIP_WRITE_INDEX_ON_LOAD
+                    + " is forbidden now.");
         } else if (value.equalsIgnoreCase("false")) {
             return false;
         }
@@ -1129,7 +1129,29 @@ public class PropertyAnalyzer {
 
     public static ReplicaAllocation analyzeReplicaAllocation(Map<String, String> properties, String prefix)
             throws AnalysisException {
+        if (!Config.force_olap_table_replication_allocation.isEmpty()) {
+            properties = forceRewriteReplicaAllocation(properties, prefix);
+        }
         return analyzeReplicaAllocationImpl(properties, prefix, true);
+    }
+
+    public static Map<String, String> forceRewriteReplicaAllocation(Map<String, String> properties,
+            String prefix) {
+        if (properties == null) {
+            properties = Maps.newHashMap();
+        }
+        String propNumKey = Strings.isNullOrEmpty(prefix) ? PROPERTIES_REPLICATION_NUM
+                : prefix + "." + PROPERTIES_REPLICATION_NUM;
+        if (properties.containsKey(propNumKey)) {
+            properties.remove(propNumKey);
+        }
+        String propTagKey = Strings.isNullOrEmpty(prefix) ? PROPERTIES_REPLICATION_ALLOCATION
+                : prefix + "." + PROPERTIES_REPLICATION_ALLOCATION;
+        if (properties.containsKey(propTagKey)) {
+            properties.remove(propTagKey);
+        }
+        properties.put(propTagKey,  Config.force_olap_table_replication_allocation);
+        return properties;
     }
 
     // There are 2 kinds of replication property:
@@ -1326,6 +1348,14 @@ public class PropertyAnalyzer {
                 throw new AnalysisException("failed to find class " + acClass, e);
             }
         }
+
+        if (isAlter) {
+            // The 'use_meta_cache' property can not be modified
+            if (properties.containsKey(ExternalCatalog.USE_META_CACHE)) {
+                throw new AnalysisException("Can not modify property " + ExternalCatalog.USE_META_CACHE
+                        + ". You need to create a new Catalog with the property.");
+            }
+        }
     }
 
     public static Map<String, String> rewriteReplicaAllocationProperties(
@@ -1364,7 +1394,7 @@ public class PropertyAnalyzer {
                 || properties.containsKey(PropertyAnalyzer.PROPERTIES_REPLICATION_NUM))) {
             return properties;
         }
-        CatalogIf catalog = Env.getCurrentEnv().getCatalogMgr().getCatalogNullable(ctl);
+        CatalogIf catalog = Env.getCurrentEnv().getCatalogMgr().getCatalog(ctl);
         if (catalog == null) {
             return properties;
         }

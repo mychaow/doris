@@ -43,6 +43,7 @@
 #include "olap/types.h"
 #include "runtime/collection_value.h"
 #include "util/block_compression.h"
+#include "util/debug_points.h"
 #include "util/faststring.h"
 #include "util/rle_encoding.h"
 #include "vec/core/types.h"
@@ -481,9 +482,40 @@ Status ScalarColumnWriter::init() {
     }
 
     if (_opts.need_inverted_index) {
-        RETURN_IF_ERROR(InvertedIndexColumnWriter::create(get_field(), &_inverted_index_builder,
-                                                          _opts.inverted_index_file_writer,
-                                                          _opts.inverted_index));
+        do {
+            DBUG_EXECUTE_IF("column_writer.init", {
+                class InvertedIndexColumnWriterEmptyImpl final : public InvertedIndexColumnWriter {
+                public:
+                    Status init() override { return Status::OK(); }
+                    Status add_values(const std::string name, const void* values,
+                                      size_t count) override {
+                        return Status::OK();
+                    }
+                    Status add_array_values(size_t field_size, const CollectionValue* values,
+                                            size_t count) override {
+                        return Status::OK();
+                    }
+                    Status add_array_values(size_t field_size, const void* value_ptr,
+                                            const uint8_t* null_map, const uint8_t* offsets_ptr,
+                                            size_t count) override {
+                        return Status::OK();
+                    }
+                    Status add_nulls(uint32_t count) override { return Status::OK(); }
+                    Status finish() override { return Status::OK(); }
+                    int64_t size() const override { return 0; }
+                    int64_t file_size() const override { return 0; }
+                    void close_on_error() override {}
+                };
+
+                _inverted_index_builder = std::make_unique<InvertedIndexColumnWriterEmptyImpl>();
+
+                break;
+            });
+
+            RETURN_IF_ERROR(InvertedIndexColumnWriter::create(get_field(), &_inverted_index_builder,
+                                                              _opts.inverted_index_file_writer,
+                                                              _opts.inverted_index));
+        } while (false);
     }
     if (_opts.need_bloom_filter) {
         if (_opts.is_ngram_bf_index) {
@@ -547,7 +579,7 @@ Status ScalarColumnWriter::append_data_in_current_page(const uint8_t* data, size
                 _inverted_index_builder->add_values(get_field()->name(), data, *num_written));
     }
     if (_opts.need_bloom_filter) {
-        _bloom_filter_index_builder->add_values(data, *num_written);
+        RETURN_IF_ERROR(_bloom_filter_index_builder->add_values(data, *num_written));
     }
 
     _next_rowid += *num_written;
@@ -686,7 +718,7 @@ Status ScalarColumnWriter::finish_current_page() {
     // build data page body : encoded values + [nullmap]
     std::vector<Slice> body;
     OwnedSlice encoded_values = _page_builder->finish();
-    _page_builder->reset();
+    RETURN_IF_ERROR(_page_builder->reset());
     body.push_back(encoded_values.slice());
 
     OwnedSlice nullmap;

@@ -46,6 +46,7 @@
 #include "olap/olap_define.h"
 #include "olap/olap_meta.h"
 #include "olap/pb_helper.h"
+#include "olap/rowset/beta_rowset.h"
 #include "olap/rowset/rowset.h"
 #include "olap/rowset/rowset_meta_manager.h"
 #include "olap/storage_engine.h"
@@ -88,7 +89,7 @@ bvar::Adder<int64_t> g_tablet_meta_schema_columns_count("tablet_meta_schema_colu
 TabletManager::TabletManager(StorageEngine& engine, int32_t tablet_map_lock_shard_size)
         : _engine(engine),
           _tablet_meta_mem_tracker(std::make_shared<MemTracker>(
-                  "TabletMeta", ExecEnv::GetInstance()->experimental_mem_tracker())),
+                  "TabletMeta(experimental)", ExecEnv::GetInstance()->details_mem_tracker_set())),
           _tablets_shards_size(tablet_map_lock_shard_size),
           _tablets_shards_mask(tablet_map_lock_shard_size - 1) {
     CHECK_GT(_tablets_shards_size, 0);
@@ -550,18 +551,9 @@ Status TabletManager::_drop_tablet_unlocked(TTabletId tablet_id, TReplicaId repl
     _remove_tablet_from_partition(to_drop_tablet);
     tablet_map_t& tablet_map = _get_tablet_map(tablet_id);
     tablet_map.erase(tablet_id);
-    {
-        std::shared_lock rlock(to_drop_tablet->get_header_lock());
-        static auto recycle_segment_cache = [](const auto& rowset_map) {
-            for (auto& [_, rowset] : rowset_map) {
-                // If the tablet was deleted, it need to remove all rowsets fds directly
-                SegmentLoader::instance()->erase_segments(rowset->rowset_id(),
-                                                          rowset->num_segments());
-            }
-        };
-        recycle_segment_cache(to_drop_tablet->rowset_map());
-        recycle_segment_cache(to_drop_tablet->stale_rowset_map());
-    }
+
+    to_drop_tablet->clear_cache();
+
     if (!keep_files) {
         // drop tablet will update tablet meta, should lock
         std::lock_guard<std::shared_mutex> wrlock(to_drop_tablet->get_header_lock());
@@ -736,6 +728,13 @@ TabletSharedPtr TabletManager::find_best_tablet_to_compaction(
     uint32_t compaction_score = 0;
     TabletSharedPtr best_tablet;
     auto handler = [&](const TabletSharedPtr& tablet_ptr) {
+        if (tablet_ptr->tablet_meta()->tablet_schema()->disable_auto_compaction()) {
+            LOG_EVERY_N(INFO, 500) << "Tablet " << tablet_ptr->tablet_id()
+                                   << " will be ignored by automatic compaction tasks since it's "
+                                   << "set to disabled automatic compaction.";
+            return;
+        }
+
         if (config::enable_skip_tablet_compaction &&
             tablet_ptr->should_skip_compaction(compaction_type, UnixSeconds())) {
             return;
@@ -846,7 +845,7 @@ Status TabletManager::load_tablet_from_meta(DataDir* data_dir, TTabletId tablet_
     // For case 1 doesn't need path check because BE is just starting and not ready,
     // just check tablet meta status to judge whether tablet is delete is enough.
     // For case 2, If a tablet has just been copied to local BE,
-    // it may be cleared by gc-thread(see perform_path_gc_by_tablet) because the tablet meta may not be loaded to memory.
+    // it may be cleared by gc-thread(see perform_tablet_gc) because the tablet meta may not be loaded to memory.
     // So clone task should check path and then failed and retry in this case.
     if (check_path) {
         bool exists = true;
@@ -1131,6 +1130,9 @@ bool TabletManager::_move_tablet_to_trash(const TabletSharedPtr& tablet) {
                          << " cur tablet_uid=" << tablet_meta->tablet_uid();
             return true;
         }
+
+        tablet->clear_cache();
+
         // move data to trash
         const auto& tablet_path = tablet->tablet_path();
         bool exists = false;
@@ -1172,6 +1174,7 @@ bool TabletManager::_move_tablet_to_trash(const TabletSharedPtr& tablet) {
                   << ", schema_hash=" << tablet->schema_hash() << ", tablet_path=" << tablet_path;
         return true;
     } else {
+        tablet->clear_cache();
         // if could not find tablet info in meta store, then check if dir existed
         const auto& tablet_path = tablet->tablet_path();
         bool exists = false;

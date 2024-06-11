@@ -21,7 +21,6 @@ suite("right_anti_join_range_date_increment_create") {
     sql "SET enable_nereids_planner=true"
     sql "SET enable_fallback_to_original_planner=false"
     sql "SET enable_materialized_view_rewrite=false"
-    sql "SET enable_nereids_timeout = false"
 
     sql """
     drop table if exists orders_right_anti_2
@@ -40,7 +39,7 @@ suite("right_anti_join_range_date_increment_create") {
     ) ENGINE=OLAP
     DUPLICATE KEY(`o_orderkey`, `o_custkey`)
     COMMENT 'OLAP'
-    AUTO PARTITION BY range date_trunc(`o_orderdate`, 'day') ()
+    auto partition by range (date_trunc(`o_orderdate`, 'day')) ()
     DISTRIBUTED BY HASH(`o_orderkey`) BUCKETS 96
     PROPERTIES (
     "replication_allocation" = "tag.location.default: 1"
@@ -70,7 +69,7 @@ suite("right_anti_join_range_date_increment_create") {
     ) ENGINE=OLAP
     DUPLICATE KEY(l_orderkey, l_linenumber, l_partkey, l_suppkey )
     COMMENT 'OLAP'
-    AUTO PARTITION BY range date_trunc(`l_shipdate`, 'day') ()
+    auto partition by range (date_trunc(`l_shipdate`, 'day')) ()
     DISTRIBUTED BY HASH(`l_orderkey`) BUCKETS 96
     PROPERTIES (
     "replication_allocation" = "tag.location.default: 1"

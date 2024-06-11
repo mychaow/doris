@@ -69,6 +69,8 @@ public class JdbcScanNode extends ExternalScanNode {
     private String tableName;
     private TOdbcTableType jdbcType;
     private String graphQueryString = "";
+    private boolean isTableValuedFunction = false;
+    private String query = "";
 
     private JdbcTable tbl;
 
@@ -84,10 +86,18 @@ public class JdbcScanNode extends ExternalScanNode {
         tableName = tbl.getProperRemoteFullTableName(jdbcType);
     }
 
+    public JdbcScanNode(PlanNodeId id, TupleDescriptor desc, boolean isTableValuedFunction, String query) {
+        super(id, desc, "JdbcScanNode", StatisticalType.JDBC_SCAN_NODE, false);
+        this.isTableValuedFunction = isTableValuedFunction;
+        this.query = query;
+        tbl = (JdbcTable) desc.getTable();
+        jdbcType = tbl.getJdbcTableType();
+        tableName = tbl.getExternalTableName();
+    }
+
     @Override
     public void init(Analyzer analyzer) throws UserException {
         super.init(analyzer);
-        getGraphQueryString();
     }
 
     /**
@@ -99,25 +109,6 @@ public class JdbcScanNode extends ExternalScanNode {
         numNodes = numNodes <= 0 ? 1 : numNodes;
         StatsRecursiveDerive.getStatsRecursiveDerive().statsRecursiveDerive(this);
         cardinality = (long) statsDeriveResult.getRowCount();
-    }
-
-    private boolean isNebula() {
-        return jdbcType == TOdbcTableType.NEBULA;
-    }
-
-    private void getGraphQueryString() {
-        if (!isNebula()) {
-            return;
-        }
-        for (Expr expr : conjuncts) {
-            FunctionCallExpr functionCallExpr = (FunctionCallExpr) expr;
-            if ("g".equals(functionCallExpr.getFnName().getFunction())) {
-                graphQueryString = functionCallExpr.getChild(0).getStringValue();
-                break;
-            }
-        }
-        // clean conjusts cause graph sannnode no need conjuncts
-        conjuncts = Lists.newArrayList();
     }
 
     private void createJdbcFilters() {
@@ -183,9 +174,6 @@ public class JdbcScanNode extends ExternalScanNode {
     }
 
     private String getJdbcQueryStr() {
-        if (isNebula()) {
-            return graphQueryString;
-        }
         StringBuilder sql = new StringBuilder("SELECT ");
 
         // Oracle use the where clause to do top n
@@ -232,14 +220,19 @@ public class JdbcScanNode extends ExternalScanNode {
     @Override
     public String getNodeExplainString(String prefix, TExplainLevel detailLevel) {
         StringBuilder output = new StringBuilder();
-        output.append(prefix).append("TABLE: ").append(tableName).append("\n");
-        if (detailLevel == TExplainLevel.BRIEF) {
-            return output.toString();
-        }
-        output.append(prefix).append("QUERY: ").append(getJdbcQueryStr()).append("\n");
-        if (!conjuncts.isEmpty()) {
-            Expr expr = convertConjunctsToAndCompoundPredicate(conjuncts);
-            output.append(prefix).append("PREDICATES: ").append(expr.toSql()).append("\n");
+        if (isTableValuedFunction) {
+            output.append(prefix).append("TABLE VALUE FUNCTION\n");
+            output.append(prefix).append("QUERY: ").append(query).append("\n");
+        } else {
+            output.append(prefix).append("TABLE: ").append(tableName).append("\n");
+            if (detailLevel == TExplainLevel.BRIEF) {
+                return output.toString();
+            }
+            output.append(prefix).append("QUERY: ").append(getJdbcQueryStr()).append("\n");
+            if (!conjuncts.isEmpty()) {
+                Expr expr = convertConjunctsToAndCompoundPredicate(conjuncts);
+                output.append(prefix).append("PREDICATES: ").append(expr.toSql()).append("\n");
+            }
         }
         return output.toString();
     }
@@ -286,7 +279,11 @@ public class JdbcScanNode extends ExternalScanNode {
         msg.jdbc_scan_node = new TJdbcScanNode();
         msg.jdbc_scan_node.setTupleId(desc.getId().asInt());
         msg.jdbc_scan_node.setTableName(tableName);
-        msg.jdbc_scan_node.setQueryString(getJdbcQueryStr());
+        if (isTableValuedFunction) {
+            msg.jdbc_scan_node.setQueryString(query);
+        } else {
+            msg.jdbc_scan_node.setQueryString(getJdbcQueryStr());
+        }
         msg.jdbc_scan_node.setTableType(jdbcType);
     }
 

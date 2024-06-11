@@ -24,6 +24,7 @@ import org.apache.doris.catalog.TableAttributes;
 import org.apache.doris.catalog.TableIf;
 import org.apache.doris.catalog.constraint.Constraint;
 import org.apache.doris.common.AnalysisException;
+import org.apache.doris.common.Pair;
 import org.apache.doris.common.io.Text;
 import org.apache.doris.common.io.Writable;
 import org.apache.doris.common.util.Util;
@@ -36,7 +37,7 @@ import org.apache.doris.statistics.TableStatsMeta;
 import org.apache.doris.statistics.util.StatisticsUtil;
 import org.apache.doris.thrift.TTableDescriptor;
 
-import com.google.common.collect.Sets;
+import com.google.common.collect.Lists;
 import com.google.gson.annotations.SerializedName;
 import lombok.Getter;
 import org.apache.commons.lang3.NotImplementedException;
@@ -46,7 +47,6 @@ import org.apache.logging.log4j.Logger;
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -143,7 +143,8 @@ public class ExternalTable implements TableIf, Writable, GsonPostProcessable {
     @Override
     public List<Column> getFullSchema() {
         ExternalSchemaCache cache = Env.getCurrentEnv().getExtMetaCacheMgr().getSchemaCache(catalog);
-        return cache.getSchema(dbName, name);
+        Optional<SchemaCacheValue> schemaCacheValue = cache.getSchemaValue(dbName, name);
+        return schemaCacheValue.map(SchemaCacheValue::getSchema).orElse(null);
     }
 
     @Override
@@ -160,7 +161,6 @@ public class ExternalTable implements TableIf, Writable, GsonPostProcessable {
     public List<Column> getBaseSchema(boolean full) {
         return getFullSchema();
     }
-
 
     @Override
     public void setNewFullSchema(List<Column> newSchema) {
@@ -203,6 +203,19 @@ public class ExternalTable implements TableIf, Writable, GsonPostProcessable {
             return 0;
         }
         // All external table should get external row count from cache.
+        return Env.getCurrentEnv().getExtMetaCacheMgr().getRowCountCache().getCachedRowCount(catalog.getId(), dbId, id);
+    }
+
+    @Override
+    public long getCachedRowCount() {
+        // Return 0 if makeSureInitialized throw exception.
+        // For example, init hive table may throw NotSupportedException.
+        try {
+            makeSureInitialized();
+        } catch (Exception e) {
+            LOG.warn("Failed to initialize table {}.{}.{}", catalog.getName(), dbName, name, e);
+            return 0;
+        }
         return Env.getCurrentEnv().getExtMetaCacheMgr().getRowCountCache().getCachedRowCount(catalog.getId(), dbId, id);
     }
 
@@ -288,12 +301,12 @@ public class ExternalTable implements TableIf, Writable, GsonPostProcessable {
      *
      * @return
      */
-    public List<Column> initSchemaAndUpdateTime() {
+    public Optional<SchemaCacheValue> initSchemaAndUpdateTime() {
         schemaUpdateTime = System.currentTimeMillis();
         return initSchema();
     }
 
-    public List<Column> initSchema() {
+    public Optional<SchemaCacheValue> initSchema() {
         throw new NotImplementedException("implement in sub class");
     }
 
@@ -322,11 +335,12 @@ public class ExternalTable implements TableIf, Writable, GsonPostProcessable {
         if (tblStats == null) {
             return true;
         }
-        if (!tblStats.analyzeColumns().containsAll(getBaseSchema()
+        if (!tblStats.analyzeColumns().containsAll(getColumnIndexPairs(
+                getBaseSchema()
                 .stream()
                 .filter(c -> !StatisticsUtil.isUnsupportedType(c.getType()))
                 .map(Column::getName)
-                .collect(Collectors.toSet()))) {
+                .collect(Collectors.toSet())))) {
             return true;
         }
         return System.currentTimeMillis()
@@ -334,16 +348,26 @@ public class ExternalTable implements TableIf, Writable, GsonPostProcessable {
     }
 
     @Override
-    public Map<String, Set<String>> findReAnalyzeNeededPartitions() {
-        HashSet<String> partitions = Sets.newHashSet();
-        // TODO: Find a way to collect external table partitions that need to be analyzed.
-        partitions.add("Dummy Partition");
-        return getBaseSchema().stream().filter(c -> !StatisticsUtil.isUnsupportedType(c.getType()))
-                .collect(Collectors.toMap(Column::getName, k -> partitions));
+    public List<Pair<String, String>> getColumnIndexPairs(Set<String> columns) {
+        List<Pair<String, String>> ret = Lists.newArrayList();
+        for (String column : columns) {
+            Column col = getColumn(column);
+            if (col == null || StatisticsUtil.isUnsupportedType(col.getType())) {
+                continue;
+            }
+            // External table put table name as index name.
+            ret.add(Pair.of(String.valueOf(name), column));
+        }
+        return ret;
     }
 
     @Override
     public List<Long> getChunkSizes() {
         throw new NotImplementedException("getChunkSized not implemented");
+    }
+
+    protected Optional<SchemaCacheValue> getSchemaCacheValue() {
+        ExternalSchemaCache cache = Env.getCurrentEnv().getExtMetaCacheMgr().getSchemaCache(catalog);
+        return cache.getSchemaValue(dbName, name);
     }
 }

@@ -20,10 +20,13 @@
 #include <gen_cpp/olap_file.pb.h>
 
 #include "olap/olap_define.h"
+#include "olap/segment_loader.h"
 #include "olap/tablet_schema.h"
 #include "util/time.h"
 
 namespace doris {
+
+static bvar::Adder<size_t> g_total_rowset_num("doris_total_rowset_num");
 
 Rowset::Rowset(const TabletSchemaSPtr& schema, const RowsetMetaSharedPtr& rowset_meta)
         : _rowset_meta(rowset_meta), _refs_by_reader(0) {
@@ -36,6 +39,11 @@ Rowset::Rowset(const TabletSchemaSPtr& schema, const RowsetMetaSharedPtr& rowset
     }
     // build schema from RowsetMeta.tablet_schema or Tablet.tablet_schema
     _schema = _rowset_meta->tablet_schema() ? _rowset_meta->tablet_schema() : schema;
+    g_total_rowset_num << 1;
+}
+
+Rowset::~Rowset() {
+    g_total_rowset_num << -1;
 }
 
 Status Rowset::load(bool use_cache) {
@@ -90,6 +98,11 @@ void Rowset::merge_rowset_meta(const RowsetMetaSharedPtr& other) {
     for (auto key_bound : key_bounds) {
         _rowset_meta->add_segment_key_bounds(key_bound);
     }
+}
+
+void Rowset::clear_cache() {
+    SegmentLoader::instance()->erase_segments(rowset_id(), num_segments());
+    clear_inverted_index_cache();
 }
 
 } // namespace doris

@@ -71,6 +71,7 @@ namespace segment_v2 {
 class InvertedIndexIterator;
 class InvertedIndexQueryCacheHandle;
 class InvertedIndexFileReader;
+struct InvertedIndexQueryInfo;
 
 class InvertedIndexReader : public std::enable_shared_from_this<InvertedIndexReader> {
 public:
@@ -97,7 +98,7 @@ public:
 
     virtual InvertedIndexReaderType type() = 0;
 
-    [[nodiscard]] uint32_t get_index_id() const { return _index_meta.index_id(); }
+    [[nodiscard]] uint64_t get_index_id() const { return _index_meta.index_id(); }
 
     [[nodiscard]] const std::map<string, string>& get_index_properties() const {
         return _index_meta.properties();
@@ -139,6 +140,8 @@ public:
                                         MemTracker* mem_tracker,
                                         InvertedIndexReaderType reader_type);
 
+    Status check_file_exist(const std::string& index_file_key);
+
 protected:
     friend class InvertedIndexIterator;
     std::shared_ptr<InvertedIndexFileReader> _inverted_index_file_reader;
@@ -171,10 +174,15 @@ public:
 
     InvertedIndexReaderType type() override;
 
+    static void setup_analyzer_lowercase(std::unique_ptr<lucene::analysis::Analyzer>& analyzer,
+                                         const std::map<string, string>& properties);
+    static void setup_analyzer_use_stopwords(std::unique_ptr<lucene::analysis::Analyzer>& analyzer,
+                                             const std::map<string, string>& properties);
+
 private:
     Status match_index_search(OlapReaderStatistics* stats, RuntimeState* runtime_state,
-                              InvertedIndexQueryType query_type, const std::wstring& field_ws,
-                              const std::vector<std::string>& analyse_result,
+                              InvertedIndexQueryType query_type,
+                              const InvertedIndexQueryInfo& query_info,
                               const FulltextIndexSearcherPtr& index_searcher,
                               const std::shared_ptr<roaring::Roaring>& term_match_bitmap);
 };

@@ -154,6 +154,8 @@ struct THdfsParams {
     3: optional string hdfs_kerberos_principal
     4: optional string hdfs_kerberos_keytab
     5: optional list<THdfsConf> hdfs_conf
+    // Used for Cold Heat Separation to specify the root path
+    6: optional string root_path
 }
 
 // One broker range information.
@@ -288,11 +290,14 @@ struct TIcebergDeleteFileDesc {
     2: optional i64 position_lower_bound;
     3: optional i64 position_upper_bound;
     4: optional list<i32> field_ids;
+    // Iceberg file type, 0: data, 1: position delete, 2: equality delete.
+    5: optional i32 content;
 }
 
 struct TIcebergFileDesc {
     1: optional i32 format_version;
     // Iceberg file type, 0: data, 1: position delete, 2: equality delete.
+    // deprecated, a data file can have both position and delete files
     2: optional i32 content;
     // When open a delete file, filter the data file path with the 'file_path' property
     3: optional list<TIcebergDeleteFileDesc> delete_files;
@@ -300,6 +305,13 @@ struct TIcebergFileDesc {
     4: optional Types.TTupleId delete_table_tuple_id;
     // Deprecated
     5: optional Exprs.TExpr file_select_conjunct;
+    6: optional string original_file_path;
+}
+
+struct TPaimonDeletionFileDesc {
+    1: optional string path;
+    2: optional i64 offset;
+    3: optional i64 length;
 }
 
 struct TPaimonFileDesc {
@@ -314,6 +326,7 @@ struct TPaimonFileDesc {
     9: optional i64 tbl_id
     10: optional i64 last_update_time
     11: optional string file_format
+    12: optional TPaimonDeletionFileDesc deletion_file;
 }
 
 struct TMaxComputeFileDesc {
@@ -429,6 +442,11 @@ struct TFileRangeDesc {
     12: optional string fs_name
 }
 
+struct TSplitSource {
+    1: optional i64 split_source_id
+    2: optional i32 num_splits
+}
+
 // TFileScanRange represents a set of descriptions of a file and the rules for reading and converting it.
 //  TFileScanRangeParams: describe how to read and convert file
 //  list<TFileRangeDesc>: file location and range
@@ -439,12 +457,12 @@ struct TFileScanRange {
     // file_scan_params in TExecPlanFragmentParams will always be set in query request,
     // and TFileScanRangeParams here is used for some other request such as fetch table schema for tvf. 
     2: optional TFileScanRangeParams params
+    3: optional TSplitSource split_source
 }
 
 // Scan range for external datasource, such as file on hdfs, es datanode, etc.
 struct TExternalScanRange {
     1: optional TFileScanRange file_scan_range
-    // TODO: add more scan range type?
 }
 
 enum TDataGenFunctionName {
@@ -870,7 +888,7 @@ struct TAggregationNode {
   7: optional list<TSortInfo> agg_sort_infos
   8: optional bool is_first_phase
   9: optional bool is_colocate
-  // 9: optional bool use_fixed_length_serialization_opt
+  10: optional TSortInfo agg_sort_info_by_group_key
 }
 
 struct TRepeatNode {
@@ -1197,6 +1215,8 @@ struct TRuntimeFilterDesc {
  
   // true, if join type is null aware like <=>. rf should dispose the case
   15: optional bool null_aware;
+
+  16: optional bool sync_filter_size;
 }
 
 
@@ -1275,10 +1295,13 @@ struct TPlanNode {
   49: optional i64 push_down_count
 
   50: optional list<list<Exprs.TExpr>> distribute_expr_lists
-  
+  // projections is final projections, which means projecting into results and materializing them into the output block.
   101: optional list<Exprs.TExpr> projections
   102: optional Types.TTupleId output_tuple_id
   103: optional TPartitionSortNode partition_sort_node
+  // Intermediate projections will not materialize into the output block.
+  104: optional list<list<Exprs.TExpr>> intermediate_projections_list
+  105: optional list<Types.TTupleId> intermediate_output_tuple_id_list
 }
 
 // A flattened representation of a tree of PlanNodes, obtained by depth-first

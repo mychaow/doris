@@ -765,6 +765,9 @@ Status SchemaChangeHandler::_do_process_alter_tablet_v2(const TAlterTabletReqV2&
         for (const auto& column : request.columns) {
             base_tablet_schema->append_column(TabletColumn(column));
         }
+        // The request only include column info, do not include bitmap or bloomfilter index info,
+        // So we also need to copy index info from the real base tablet
+        base_tablet_schema->update_index_info_from(*base_tablet->tablet_schema());
     }
     // Use tablet schema directly from base tablet, they are the newest schema, not contain
     // dropped column during light weight schema change.
@@ -789,10 +792,19 @@ Status SchemaChangeHandler::_do_process_alter_tablet_v2(const TAlterTabletReqV2&
         do {
             RowsetSharedPtr max_rowset;
             // get history data to be converted and it will check if there is hold in base tablet
-            if (!_get_versions_to_be_changed(base_tablet, &versions_to_be_changed, &max_rowset)) {
+            res = _get_versions_to_be_changed(base_tablet, &versions_to_be_changed, &max_rowset);
+            if (!res) {
                 LOG(WARNING) << "fail to get version to be changed. res=" << res;
                 break;
             }
+
+            DBUG_EXECUTE_IF("SchemaChangeJob.process_alter_tablet.alter_fail", {
+                res = Status::InternalError(
+                        "inject alter tablet failed. base_tablet={}, new_tablet={}",
+                        request.base_tablet_id, request.new_tablet_id);
+                LOG(WARNING) << "inject error. res=" << res;
+                break;
+            });
 
             // should check the max_version >= request.alter_version, if not the convert is useless
             if (max_rowset == nullptr || max_rowset->end_version() < request.alter_version) {
@@ -948,6 +960,8 @@ Status SchemaChangeHandler::_do_process_alter_tablet_v2(const TAlterTabletReqV2&
             break;
         }
 
+        DCHECK_GE(real_alter_version, request.alter_version);
+
         if (new_tablet->keys_type() == UNIQUE_KEYS &&
             new_tablet->enable_unique_key_merge_on_write()) {
             res = _calc_delete_bitmap_for_mow_table(new_tablet, real_alter_version);
@@ -975,7 +989,7 @@ Status SchemaChangeHandler::_do_process_alter_tablet_v2(const TAlterTabletReqV2&
     // if failed convert history data, then just remove the new tablet
     if (!res) {
         LOG(WARNING) << "failed to alter tablet. base_tablet=" << base_tablet->tablet_id()
-                     << ", drop new_tablet=" << new_tablet->tablet_id();
+                     << ", drop new_tablet=" << new_tablet->tablet_id() << res;
         // do not drop the new tablet and its data. GC thread will
     }
 
@@ -1066,6 +1080,7 @@ Status SchemaChangeHandler::_convert_historical_rowsets(const SchemaChangeParams
     auto sc_procedure = get_sc_procedure(changer, sc_sorting, sc_directly);
 
     // c.Convert historical data
+    bool have_failure_rowset = false;
     for (const auto& rs_reader : sc_params.ref_rowset_readers) {
         VLOG_TRACE << "begin to convert a history rowset. version=" << rs_reader->version().first
                    << "-" << rs_reader->version().second;
@@ -1116,6 +1131,7 @@ Status SchemaChangeHandler::_convert_historical_rowsets(const SchemaChangeParams
                          << "tablet=" << sc_params.new_tablet->tablet_id() << ", version='"
                          << rs_reader->version().first << "-" << rs_reader->version().second;
             StorageEngine::instance()->add_unused_rowset(new_rowset);
+            have_failure_rowset = true;
             res = Status::OK();
         } else if (!res) {
             LOG(WARNING) << "failed to register new version. "
@@ -1129,7 +1145,9 @@ Status SchemaChangeHandler::_convert_historical_rowsets(const SchemaChangeParams
                         << ", version=" << rs_reader->version().first << "-"
                         << rs_reader->version().second;
         }
-        *real_alter_version = rs_reader->version().second;
+        if (!have_failure_rowset) {
+            *real_alter_version = rs_reader->version().second;
+        }
 
         VLOG_TRACE << "succeed to convert a history version."
                    << " version=" << rs_reader->version().first << "-"
@@ -1284,6 +1302,15 @@ Status SchemaChangeHandler::_parse_request(const SchemaChangeParams& sc_params,
         if (column_mapping->expr != nullptr) {
             *sc_directly = true;
             return Status::OK();
+        } else if (column_mapping->ref_column >= 0) {
+            const auto& column_new = new_tablet_schema->column(i);
+            const auto& column_old = base_tablet_schema->column(column_mapping->ref_column);
+            // index changed
+            if (column_new.is_bf_column() != column_old.is_bf_column() ||
+                column_new.has_bitmap_index() != column_old.has_bitmap_index()) {
+                *sc_directly = true;
+                return Status::OK();
+            }
         }
     }
 

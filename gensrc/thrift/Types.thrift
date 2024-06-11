@@ -222,7 +222,8 @@ enum TTaskType {
     PUSH_COOLDOWN_CONF,
     PUSH_STORAGE_POLICY,
     ALTER_INVERTED_INDEX,
-    GC_BINLOG
+    GC_BINLOG,
+    CLEAN_TRASH
 }
 
 enum TStmtType {
@@ -398,7 +399,7 @@ enum TOdbcTableType {
     PRESTO,
     OCEANBASE,
     OCEANBASE_ORACLE,
-    NEBULA,
+    NEBULA, // Deprecated
     DB2
 }
 

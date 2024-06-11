@@ -84,6 +84,7 @@ public:
     virtual ~VExpr() = default;
 
     virtual const std::string& expr_name() const = 0;
+    virtual std::string expr_label() { return ""; }
 
     /// Initializes this expr instance for execution. This does not include initializing
     /// state in the VExprContext; 'context' should only be used to register a
@@ -133,6 +134,7 @@ public:
     TypeDescriptor type() { return _type; }
 
     bool is_slot_ref() const { return _node_type == TExprNodeType::SLOT_REF; }
+    virtual bool is_literal() const { return false; }
 
     TExprNodeType::type node_type() const { return _node_type; }
 
@@ -162,6 +164,9 @@ public:
 
     static Status create_tree_from_thrift(const std::vector<TExprNode>& nodes, int* node_idx,
                                           VExprSPtr& root_expr, VExprContextSPtr& ctx);
+
+    static Status check_expr_output_type(const VExprContextSPtrs& ctxs,
+                                         const RowDescriptor& output_row_desc);
     virtual const VExprSPtrs& children() const { return _children; }
     void set_children(const VExprSPtrs& children) { _children = children; }
     void set_children(VExprSPtrs&& children) { _children = std::move(children); }
@@ -215,6 +220,13 @@ public:
                    << this->debug_string();
         return nullptr;
     }
+
+    // fast_execute can direct copy expr filter result which build by apply index in segment_iterator
+    bool fast_execute(Block& block, const ColumnNumbers& arguments, size_t result,
+                      size_t input_rows_count, const std::string& function_name);
+
+    std::string gen_predicate_result_sign(Block& block, const ColumnNumbers& arguments,
+                                          const std::string& function_name);
 
 protected:
     /// Simple debug string that provides no expr subclass-specific information

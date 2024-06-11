@@ -48,7 +48,10 @@ import groovy.util.logging.Slf4j
 
 import java.sql.Connection
 import java.util.concurrent.Callable
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 import java.util.concurrent.Future
+import java.util.concurrent.ThreadFactory
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.stream.Collectors
 import java.util.stream.LongStream
@@ -68,6 +71,9 @@ class Suite implements GroovyInterceptable {
     final String name
     final String group
     final Logger logger = LoggerFactory.getLogger(this.class)
+
+    // set this in suite to determine which hive docker to use
+    String hivePrefix = "hive2"
 
     final List<Closure> successCallbacks = new Vector<>()
     final List<Closure> failCallbacks = new Vector<>()
@@ -163,33 +169,63 @@ class Suite implements GroovyInterceptable {
         return SuiteUtils.timer(actionSupplier)
     }
 
-    public <T> ListenableFuture<T> thread(String threadName = null, Closure<T> actionSupplier) {
-        def connInfo = context.threadLocalConn.get()
-        return MoreExecutors.listeningDecorator(context.actionExecutors).submit((Callable<T>) {
-            long startTime = System.currentTimeMillis()
-            def originThreadName = Thread.currentThread().name
-            try {
-                Thread.currentThread().setName(threadName == null ? originThreadName : threadName)
-                if (connInfo != null) {
-                    context.connectTo(connInfo.conn.getMetaData().getURL(), connInfo.username, connInfo.password);
-                }
-                context.scriptContext.eventListeners.each { it.onThreadStarted(context) }
-
-                return actionSupplier.call()
-            } catch (Throwable t) {
-                context.scriptContext.eventListeners.each { it.onThreadFailed(context, t) }
-                throw t
-            } finally {
-                try {
-                    context.closeThreadLocal()
-                } catch (Throwable t) {
-                    logger.warn("Close thread local context failed", t)
-                }
-                long finishTime = System.currentTimeMillis()
-                context.scriptContext.eventListeners.each { it.onThreadFinished(context, finishTime - startTime) }
-                Thread.currentThread().setName(originThreadName)
+    public <T> ListenableFuture<T> extraThread(
+            String threadName = null, boolean daemon = false, Closure<T> actionSupplier) {
+        def executorService = Executors.newFixedThreadPool(1, new ThreadFactory() {
+            @Override
+            Thread newThread(Runnable r) {
+                def thread = new Thread(r, name)
+                thread.setDaemon(daemon)
+                return thread
             }
         })
+
+        try {
+            def connInfo = context.threadLocalConn.get()
+            return MoreExecutors.listeningDecorator(executorService).submit(
+                    buildThreadCallable(threadName, connInfo, actionSupplier)
+            )
+        } finally {
+            executorService.shutdown()
+        }
+    }
+
+    public <T> ListenableFuture<T> thread(String threadName = null, Closure<T> actionSupplier) {
+        def connInfo = context.threadLocalConn.get()
+        return MoreExecutors.listeningDecorator(context.actionExecutors).submit(
+                buildThreadCallable(threadName, connInfo, actionSupplier)
+        )
+    }
+
+    private <T> Callable<T> buildThreadCallable(String threadName, ConnectionInfo connInfo, Closure<T> actionSupplier) {
+        return new Callable<T>() {
+            @Override
+            T call() throws Exception {
+                long startTime = System.currentTimeMillis()
+                def originThreadName = Thread.currentThread().name
+                try {
+                    Thread.currentThread().setName(threadName == null ? originThreadName : threadName)
+                    if (connInfo != null) {
+                        context.connectTo(connInfo.conn.getMetaData().getURL(), connInfo.username, connInfo.password);
+                    }
+                    context.scriptContext.eventListeners.each { it.onThreadStarted(context) }
+
+                    return actionSupplier.call()
+                } catch (Throwable t) {
+                    context.scriptContext.eventListeners.each { it.onThreadFailed(context, t) }
+                    throw t
+                } finally {
+                    try {
+                        context.closeThreadLocal()
+                    } catch (Throwable t) {
+                        logger.warn("Close thread local context failed", t)
+                    }
+                    long finishTime = System.currentTimeMillis()
+                    context.scriptContext.eventListeners.each { it.onThreadFinished(context, finishTime - startTime) }
+                    Thread.currentThread().setName(originThreadName)
+                }
+            }
+        };
     }
 
     public <T> ListenableFuture<T> lazyCheckThread(String threadName = null, Closure<T> actionSupplier) {
@@ -242,7 +278,16 @@ class Suite implements GroovyInterceptable {
                 }
                 Thread.sleep(1000)
             }
+
             assertNotNull(fe)
+            if (!dockerIsCloud) {
+                for (def be : cluster.getAllBackends()) {
+                    be_report_disk(be.host, be.httpPort)
+                }
+            }
+
+            // wait be report
+            Thread.sleep(5000)
             def url = String.format(
                     "jdbc:mysql://%s:%s/?useLocalSessionState=false&allowLoadLocalInfile=false",
                     fe.host, fe.queryPort)
@@ -255,7 +300,9 @@ class Suite implements GroovyInterceptable {
             logger.info("connect to docker cluster: suite={}, url={}", name, url)
             connect(user, password, url, actionSupplier)
         } finally {
-            cluster.destroy(context.config.dockerEndDeleteFiles)
+            if (!context.config.dockerEndNoKill) {
+                cluster.destroy(context.config.dockerEndDeleteFiles)
+            }
         }
     }
 
@@ -303,6 +350,17 @@ class Suite implements GroovyInterceptable {
         } else {
             return jdbc_sql(sqlStr, isOrder)
         }
+    }
+
+    List<List<Object>> multi_sql(String sqlStr, boolean isOrder = false) {
+        String[] sqls = sqlStr.split(";")
+        def result = new ArrayList<Object>();
+        for (String query : sqls) {
+            if (!query.trim().isEmpty()) {
+                result.add(sql(query, isOrder));
+            }
+        }
+        return result
     }
 
     List<List<Object>> arrow_flight_sql_no_prepared (String sqlStr, boolean isOrder = false){
@@ -751,16 +809,21 @@ class Suite implements GroovyInterceptable {
         return JdbcUtils.prepareStatement(context.getConnection(), sql)
     }
 
-    List<List<Object>> hive_docker(String sqlStr, boolean isOrder = false){
+    void setHivePrefix(String hivePrefix) {
+        this.hivePrefix = hivePrefix
+    }
+
+    List<List<Object>> hive_docker(String sqlStr, boolean isOrder = false) {
+        logger.info("Execute hive ql: ${sqlStr}".toString())
         String cleanedSqlStr = sqlStr.replaceAll("\\s*;\\s*\$", "")
-        def (result, meta) = JdbcUtils.executeToList(context.getHiveDockerConnection(), cleanedSqlStr)
+        def (result, meta) = JdbcUtils.executeToList(context.getHiveDockerConnection(hivePrefix), cleanedSqlStr)
         if (isOrder) {
             result = DataUtils.sortByToString(result)
         }
         return result
     }
 
-    List<List<Object>> hive_remote(String sqlStr, boolean isOrder = false){
+    List<List<Object>> hive_remote(String sqlStr, boolean isOrder = false) {
         String cleanedSqlStr = sqlStr.replaceAll("\\s*;\\s*\$", "")
         def (result, meta) = JdbcUtils.executeToList(context.getHiveRemoteConnection(), cleanedSqlStr)
         if (isOrder) {
@@ -769,12 +832,17 @@ class Suite implements GroovyInterceptable {
         return result
     }
 
-    List<List<Object>> db2_docker(String sqlStr, boolean isOrder = false){
+    List<List<Object>> db2_docker(String sqlStr, boolean isOrder = false) {
         String cleanedSqlStr = sqlStr.replaceAll("\\s*;\\s*\$", "")
         def (result, meta) = JdbcUtils.executeToList(context.getDB2DockerConnection(), cleanedSqlStr)
         if (isOrder) {
             result = DataUtils.sortByToString(result)
         }
+        return result
+    }
+    List<List<Object>> exec(Object stmt) {
+        logger.info("Execute sql: ${stmt}".toString())
+        def (result, meta )= JdbcUtils.executeToList(context.getConnection(),  (PreparedStatement) stmt)
         return result
     }
 
@@ -783,25 +851,27 @@ class Suite implements GroovyInterceptable {
             Tuple2<List<List<Object>>, ResultSetMetaData> tupleResult = null
             if (arg instanceof PreparedStatement) {
                 if (tag.contains("hive_docker")) {
-                    tupleResult = JdbcUtils.executeToStringList(context.getHiveDockerConnection(),  (PreparedStatement) arg)
+                    tupleResult = JdbcUtils.executeToStringList(context.getHiveDockerConnection(hivePrefix),  (PreparedStatement) arg)
                 }else if (tag.contains("hive_remote")) {
                     tupleResult = JdbcUtils.executeToStringList(context.getHiveRemoteConnection(),  (PreparedStatement) arg)
                 } else if (tag.contains("arrow_flight_sql") || context.useArrowFlightSql()) {
                     tupleResult = JdbcUtils.executeToStringList(context.getArrowFlightSqlConnection(), (PreparedStatement) arg)
-                }
-                else{
+                } else if (tag.contains("target_sql")) {
+                    tupleResult = JdbcUtils.executeToStringList(context.getTargetConnection(this), (PreparedStatement) arg)
+                } else {
                     tupleResult = JdbcUtils.executeToStringList(context.getConnection(),  (PreparedStatement) arg)
                 }
             } else {
                 if (tag.contains("hive_docker")) {
-                    tupleResult = JdbcUtils.executeToStringList(context.getHiveDockerConnection(), (String) arg)
+                    tupleResult = JdbcUtils.executeToStringList(context.getHiveDockerConnection(hivePrefix), (String) arg)
                 }else if (tag.contains("hive_remote")) {
                     tupleResult = JdbcUtils.executeToStringList(context.getHiveRemoteConnection(), (String) arg)
                 } else if (tag.contains("arrow_flight_sql") || context.useArrowFlightSql()) {
                     tupleResult = JdbcUtils.executeToStringList(context.getArrowFlightSqlConnection(),
                             (String) ("USE ${context.dbName};" + (String) arg))
-                }
-                else{
+                } else if (tag.contains("target_sql")) {
+                    tupleResult = JdbcUtils.executeToStringList(context.getTargetConnection(this), (String) arg)
+                } else {
                     tupleResult = JdbcUtils.executeToStringList(context.getConnection(),  (String) arg)
                 }
             }
@@ -826,25 +896,27 @@ class Suite implements GroovyInterceptable {
             Tuple2<List<List<Object>>, ResultSetMetaData> tupleResult = null
             if (arg instanceof PreparedStatement) {
                 if (tag.contains("hive_docker")) {
-                    tupleResult = JdbcUtils.executeToStringList(context.getHiveDockerConnection(),  (PreparedStatement) arg)
+                    tupleResult = JdbcUtils.executeToStringList(context.getHiveDockerConnection(hivePrefix),  (PreparedStatement) arg)
                 }else if (tag.contains("hive_remote")) {
                     tupleResult = JdbcUtils.executeToStringList(context.getHiveRemoteConnection(),  (PreparedStatement) arg)
                 } else if (tag.contains("arrow_flight_sql") || context.useArrowFlightSql()) {
                     tupleResult = JdbcUtils.executeToStringList(context.getArrowFlightSqlConnection(), (PreparedStatement) arg)
-                }
-                else{
+                } else if (tag.contains("target_sql")) {
+                    tupleResult = JdbcUtils.executeToStringList(context.getTargetConnection(this), (PreparedStatement) arg)
+                } else {
                     tupleResult = JdbcUtils.executeToStringList(context.getConnection(),  (PreparedStatement) arg)
                 }
             } else {
                 if (tag.contains("hive_docker")) {
-                    tupleResult = JdbcUtils.executeToStringList(context.getHiveDockerConnection(), (String) arg)
+                    tupleResult = JdbcUtils.executeToStringList(context.getHiveDockerConnection(hivePrefix), (String) arg)
                 }else if (tag.contains("hive_remote")) {
                     tupleResult = JdbcUtils.executeToStringList(context.getHiveRemoteConnection(), (String) arg)
                 } else if (tag.contains("arrow_flight_sql") || context.useArrowFlightSql()) {
                     tupleResult = JdbcUtils.executeToStringList(context.getArrowFlightSqlConnection(),
                             (String) ("USE ${context.dbName};" + (String) arg))
-                }
-                else{
+                } else if (tag.contains("target_sql")) {
+                    tupleResult = JdbcUtils.executeToStringList(context.getTargetConnection(this), (String) arg)
+                } else {
                     tupleResult = JdbcUtils.executeToStringList(context.getConnection(),  (String) arg)
                 }
             }
@@ -867,7 +939,12 @@ class Suite implements GroovyInterceptable {
                 throw new IllegalStateException("Check tag '${tag}' failed, sql:\n${arg}", t)
             }
             if (errorMsg != null) {
-                logger.warn("expect results: " + expectCsvResults + "\nrealResults: " + realResults)
+                String csvRealResult = realResults.stream()
+                    .map {row -> OutputUtils.toCsvString(row)}
+                    .collect(Collectors.joining("\n"))
+                def outputFilePath = context.outputFile.getCanonicalPath().substring(context.config.dataPath.length() + 1)
+                def line = expectCsvResults.currentLine()
+                logger.warn("expect results in file: ${outputFilePath}, line: ${line}\nrealResults:\n" + csvRealResult)
                 throw new IllegalStateException("Check tag '${tag}' failed:\n${errorMsg}\n\nsql:\n${arg}")
             }
         }
@@ -954,6 +1031,54 @@ class Suite implements GroovyInterceptable {
 
     DebugPoint GetDebugPoint() {
         return debugPoint
+    }
+
+    void waitingMTMVTaskFinishedByMvName(String mvName) {
+        Thread.sleep(2000);
+        String showTasks = "select TaskId,JobId,JobName,MvId,Status,MvName,MvDatabaseName,ErrorMsg from tasks('type'='mv') where MvName = '${mvName}' order by CreateTime ASC"
+        String status = "NULL"
+        List<List<Object>> result
+        long startTime = System.currentTimeMillis()
+        long timeoutTimestamp = startTime + 5 * 60 * 1000 // 5 min
+        do {
+            result = sql(showTasks)
+            logger.info("result: " + result.toString())
+            if (!result.isEmpty()) {
+                status = result.last().get(4)
+            }
+            logger.info("The state of ${showTasks} is ${status}")
+            Thread.sleep(1000);
+        } while (timeoutTimestamp > System.currentTimeMillis() && (status == 'PENDING' || status == 'RUNNING' || status == 'NULL'))
+        if (status != "SUCCESS") {
+            logger.info("status is not success")
+        }
+        Assert.assertEquals("SUCCESS", status)
+    }
+
+    void waitingPartitionIsExpected(String tableName, String partitionName, boolean expectedStatus) {
+        Thread.sleep(2000);
+        String showPartitions = "show partitions from ${tableName}"
+        Boolean status = null;
+        List<List<Object>> result
+        long startTime = System.currentTimeMillis()
+        long timeoutTimestamp = startTime + 1 * 60 * 1000 // 1 min
+        do {
+            result = sql(showPartitions)
+            if (!result.isEmpty()) {
+                for (List<Object> row : result) {
+                    def existPartitionName = row.get(1).toString()
+                    if (Objects.equals(existPartitionName, partitionName)) {
+                        def statusStr = row.get(row.size() - 2).toString()
+                        status = Boolean.valueOf(statusStr)
+                    }
+                }
+            }
+            Thread.sleep(500);
+        } while (timeoutTimestamp > System.currentTimeMillis() && !Objects.equals(status, expectedStatus))
+        if (!Objects.equals(status, expectedStatus)) {
+            logger.info("partition status is not expected")
+        }
+        Assert.assertEquals(expectedStatus, status)
     }
 
     void waitingMTMVTaskFinished(String jobName) {

@@ -47,6 +47,7 @@ using InstanceLoId = int64_t;
 
 namespace pipeline {
 class Dependency;
+class ExchangeSinkLocalState;
 } // namespace pipeline
 
 namespace vectorized {
@@ -177,6 +178,7 @@ public:
             LOG(FATAL) << "brpc callback error: " << exp.what();
         } catch (...) {
             LOG(FATAL) << "brpc callback error.";
+            __builtin_unreachable();
         }
     }
     int64_t start_rpc_time;
@@ -198,8 +200,8 @@ template <typename Parent>
 class ExchangeSinkBuffer : public HasTaskExecutionCtx {
 public:
     ExchangeSinkBuffer(PUniqueId query_id, PlanNodeId dest_node_id, int send_id, int be_number,
-                       RuntimeState* state);
-    ~ExchangeSinkBuffer();
+                       RuntimeState* state, ExchangeSinkLocalState* parent = nullptr);
+    ~ExchangeSinkBuffer() = default;
     void register_sink(TUniqueId);
 
     Status add_block(TransmitInfo<Parent>&& request);
@@ -214,6 +216,10 @@ public:
                         std::shared_ptr<Dependency> finish_dependency) {
         _queue_dependency = queue_dependency;
         _finish_dependency = finish_dependency;
+    }
+
+    void set_broadcast_dependency(std::shared_ptr<Dependency> broadcast_dependency) {
+        _broadcast_dependency = broadcast_dependency;
     }
 
     void set_should_stop() {
@@ -266,13 +272,16 @@ private:
     inline void _failed(InstanceLoId id, const std::string& err);
     inline void _set_receiver_eof(InstanceLoId id);
     inline bool _is_receiver_eof(InstanceLoId id);
+    inline void _turn_off_channel(InstanceLoId id, bool cleanup = false);
     void get_max_min_rpc_time(int64_t* max_time, int64_t* min_time);
     int64_t get_sum_rpc_time();
 
     std::atomic<int> _total_queue_size = 0;
-    std::shared_ptr<Dependency> _queue_dependency;
-    std::shared_ptr<Dependency> _finish_dependency;
-    std::atomic<bool> _should_stop {false};
+    std::shared_ptr<Dependency> _queue_dependency = nullptr;
+    std::shared_ptr<Dependency> _finish_dependency = nullptr;
+    std::shared_ptr<Dependency> _broadcast_dependency = nullptr;
+    std::atomic<bool> _should_stop = false;
+    ExchangeSinkLocalState* _parent = nullptr;
 };
 
 } // namespace pipeline

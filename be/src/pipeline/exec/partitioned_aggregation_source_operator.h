@@ -60,8 +60,6 @@ protected:
     std::future<Status> _spill_merge_future;
     bool _current_partition_eos = true;
     bool _is_merging = false;
-    std::mutex _merge_spill_lock;
-    std::condition_variable _merge_spill_cv;
 
     std::unique_ptr<RuntimeProfile> _internal_runtime_profile;
     RuntimeProfile::Counter* _get_results_timer = nullptr;

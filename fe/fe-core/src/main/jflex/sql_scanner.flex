@@ -206,6 +206,7 @@ import org.apache.doris.qe.SqlModeHelper;
         keywordMap.put("double", new Integer(SqlParserSymbols.KW_DOUBLE));
         keywordMap.put("drop", new Integer(SqlParserSymbols.KW_DROP));
         keywordMap.put("dropp", new Integer(SqlParserSymbols.KW_DROPP));
+        keywordMap.put("dual", new Integer(SqlParserSymbols.KW_DUAL));
         keywordMap.put("duplicate", new Integer(SqlParserSymbols.KW_DUPLICATE));
         keywordMap.put("dynamic", new Integer(SqlParserSymbols.KW_DYNAMIC));
         keywordMap.put("else", new Integer(SqlParserSymbols.KW_ELSE));
@@ -325,11 +326,6 @@ import org.apache.doris.qe.SqlModeHelper;
         keywordMap.put("match_phrase_prefix", new Integer(SqlParserSymbols.KW_MATCH_PHRASE_PREFIX));
         keywordMap.put("match_regexp", new Integer(SqlParserSymbols.KW_MATCH_REGEXP));
         keywordMap.put("match_phrase_edge", new Integer(SqlParserSymbols.KW_MATCH_PHRASE_EDGE));
-        keywordMap.put("element_eq", new Integer(SqlParserSymbols.KW_MATCH_ELEMENT_EQ));
-        keywordMap.put("element_lt", new Integer(SqlParserSymbols.KW_MATCH_ELEMENT_LT));
-        keywordMap.put("element_gt", new Integer(SqlParserSymbols.KW_MATCH_ELEMENT_GT));
-        keywordMap.put("element_le", new Integer(SqlParserSymbols.KW_MATCH_ELEMENT_LE));
-        keywordMap.put("element_ge", new Integer(SqlParserSymbols.KW_MATCH_ELEMENT_GE));
         keywordMap.put("materialized", new Integer(SqlParserSymbols.KW_MATERIALIZED));
         keywordMap.put("max", new Integer(SqlParserSymbols.KW_MAX));
         keywordMap.put("maxvalue", new Integer(SqlParserSymbols.KW_MAX_VALUE));
@@ -379,6 +375,7 @@ import org.apache.doris.qe.SqlModeHelper;
         keywordMap.put("policy", new Integer(SqlParserSymbols.KW_POLICY));
         keywordMap.put("preceding", new Integer(SqlParserSymbols.KW_PRECEDING));
         keywordMap.put("percent", new Integer(SqlParserSymbols.KW_PERCENT));
+        keywordMap.put("privileges", new Integer(SqlParserSymbols.KW_PRIVILEGES));
         keywordMap.put("proc", new Integer(SqlParserSymbols.KW_PROC));
         keywordMap.put("procedure", new Integer(SqlParserSymbols.KW_PROCEDURE));
         keywordMap.put("processlist", new Integer(SqlParserSymbols.KW_PROCESSLIST));
@@ -504,6 +501,7 @@ import org.apache.doris.qe.SqlModeHelper;
         keywordMap.put("verbose", new Integer(SqlParserSymbols.KW_VERBOSE));
         keywordMap.put("version", new Integer(SqlParserSymbols.KW_VERSION));
         keywordMap.put("view", new Integer(SqlParserSymbols.KW_VIEW));
+        keywordMap.put("views", new Integer(SqlParserSymbols.KW_VIEWS));
         keywordMap.put("warnings", new Integer(SqlParserSymbols.KW_WARNINGS));
         keywordMap.put("week", new Integer(SqlParserSymbols.KW_WEEK));
         keywordMap.put("when", new Integer(SqlParserSymbols.KW_WHEN));
@@ -578,7 +576,6 @@ import org.apache.doris.qe.SqlModeHelper;
     tokenIdMap.put(new Integer(SqlParserSymbols.BITXOR), "^");
     tokenIdMap.put(new Integer(SqlParserSymbols.NUMERIC_OVERFLOW), "NUMERIC OVERFLOW");
     tokenIdMap.put(new Integer(SqlParserSymbols.PLACEHOLDER), "?");
-
   }
 
   public static boolean isKeyword(Integer tokenId) {

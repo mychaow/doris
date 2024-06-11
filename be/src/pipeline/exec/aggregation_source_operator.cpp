@@ -490,8 +490,7 @@ Status AggLocalState::merge_with_serialized_key_helper(vectorized::Block* block)
                             ->function()
                             ->deserialize_and_merge_vec_selected(
                                     _places.data(), _shared_state->offsets_of_aggregate_states[i],
-                                    _deserialize_buffer.data(),
-                                    (vectorized::ColumnString*)(column.get()),
+                                    _deserialize_buffer.data(), column.get(),
                                     _shared_state->agg_arena_pool.get(), rows);
                 }
             } else {
@@ -522,14 +521,9 @@ Status AggLocalState::merge_with_serialized_key_helper(vectorized::Block* block)
                 SCOPED_TIMER(_deserialize_data_timer);
                 Base::_shared_state->aggregate_evaluators[i]->function()->deserialize_and_merge_vec(
                         _places.data(), _shared_state->offsets_of_aggregate_states[i],
-                        _deserialize_buffer.data(), (vectorized::ColumnString*)(column.get()),
+                        _deserialize_buffer.data(), column.get(),
                         _shared_state->agg_arena_pool.get(), rows);
             }
-        }
-
-        if (_should_limit_output) {
-            _reach_limit = _get_hash_table_size() >=
-                           Base::_parent->template cast<AggSourceOperatorX>()._limit;
         }
     }
 
@@ -625,7 +619,7 @@ Status AggLocalState::close(RuntimeState* state) {
     }
 
     /// _hash_table_size_counter may be null if prepare failed.
-    if (_hash_table_size_counter) {
+    if (_hash_table_size_counter && _shared_state->ready_to_execute) {
         std::visit(
                 [&](auto&& agg_method) {
                     COUNTER_SET(_hash_table_size_counter, int64_t(agg_method.hash_table->size()));

@@ -76,6 +76,9 @@
 namespace doris {
 namespace segment_v2 {
 
+static bvar::Adder<size_t> g_column_reader_memory_bytes("doris_column_reader_memory_bytes");
+static bvar::Adder<size_t> g_column_reader_num("doris_column_reader_num");
+
 Status ColumnReader::create(const ColumnReaderOptions& opts, const ColumnMetaPB& meta,
                             uint64_t num_rows, const io::FileReaderSPtr& file_reader,
                             std::unique_ptr<ColumnReader>* reader) {
@@ -205,9 +208,15 @@ ColumnReader::ColumnReader(const ColumnReaderOptions& opts, const ColumnMetaPB& 
     _meta_is_nullable = meta.is_nullable();
     _meta_dict_page = meta.dict_page();
     _meta_compression = meta.compression();
+
+    g_column_reader_memory_bytes << sizeof(*this);
+    g_column_reader_num << 1;
 }
 
-ColumnReader::~ColumnReader() = default;
+ColumnReader::~ColumnReader() {
+    g_column_reader_memory_bytes << -sizeof(*this);
+    g_column_reader_num << -1;
+}
 
 Status ColumnReader::init(const ColumnMetaPB* meta) {
     _type_info = get_type_info(meta);
@@ -262,9 +271,12 @@ Status ColumnReader::new_inverted_index_iterator(
         std::shared_ptr<InvertedIndexFileReader> index_file_reader, const TabletIndex* index_meta,
         const StorageReadOptions& read_options, std::unique_ptr<InvertedIndexIterator>* iterator) {
     RETURN_IF_ERROR(_ensure_inverted_index_loaded(index_file_reader, index_meta));
-    if (_inverted_index) {
-        RETURN_IF_ERROR(_inverted_index->new_iterator(read_options.stats,
-                                                      read_options.runtime_state, iterator));
+    {
+        std::shared_lock<std::shared_mutex> rlock(_load_index_lock);
+        if (_inverted_index) {
+            RETURN_IF_ERROR(_inverted_index->new_iterator(read_options.stats,
+                                                          read_options.runtime_state, iterator));
+        }
     }
     return Status::OK();
 }
@@ -536,7 +548,7 @@ Status ColumnReader::_load_bitmap_index(bool use_page_cache, bool kept_in_memory
 
 Status ColumnReader::_load_inverted_index_index(
         std::shared_ptr<InvertedIndexFileReader> index_file_reader, const TabletIndex* index_meta) {
-    std::lock_guard<std::mutex> wlock(_load_index_lock);
+    std::unique_lock<std::shared_mutex> wlock(_load_index_lock);
 
     if (_inverted_index && index_meta &&
         _inverted_index->get_index_id() == index_meta->index_id()) {
@@ -1536,7 +1548,7 @@ Status VariantRootColumnIterator::read_by_rowids(const rowid_t* rowids, const si
     RETURN_IF_ERROR(_inner_iter->read_by_rowids(rowids, count, root_column));
     obj.incr_num_rows(count);
     for (auto& entry : obj.get_subcolumns()) {
-        if (entry->data.size() != size + count) {
+        if (entry->data.size() != (size + count)) {
             entry->data.insertManyDefaults(count);
         }
     }
@@ -1546,7 +1558,8 @@ Status VariantRootColumnIterator::read_by_rowids(const rowid_t* rowids, const si
                 assert_cast<vectorized::ColumnNullable&>(*dst).get_null_map_column();
         vectorized::ColumnUInt8& src_null_map =
                 assert_cast<vectorized::ColumnNullable&>(*root_column).get_null_map_column();
-        dst_null_map.insert_range_from(src_null_map, 0, src_null_map.size());
+        DCHECK_EQ(src_null_map.size() - size, count);
+        dst_null_map.insert_range_from(src_null_map, size, count);
     }
 #ifndef NDEBUG
     obj.check_consistency();

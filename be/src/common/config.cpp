@@ -78,6 +78,8 @@ DEFINE_String(priority_networks, "");
 // performance or compact
 DEFINE_String(memory_mode, "moderate");
 
+DEFINE_mBool(enable_use_cgroup_memory_info, "true");
+
 // process memory limit specified as number of bytes
 // ('<int>[bB]?'), megabytes ('<float>[mM]'), gigabytes ('<float>[gG]'),
 // or percentage of the physical memory ('<int>%').
@@ -131,6 +133,8 @@ DEFINE_mBool(enable_query_memory_overcommit, "true");
 DEFINE_mBool(disable_memory_gc, "false");
 
 DEFINE_mInt64(large_memory_check_bytes, "2147483648");
+
+DEFINE_mBool(enable_memory_orphan_check, "true");
 
 // The maximum time a thread waits for full GC. Currently only query will wait for full gc.
 DEFINE_mInt32(thread_wait_gc_max_milliseconds, "1000");
@@ -197,10 +201,8 @@ DEFINE_mInt32(download_low_speed_limit_kbps, "50");
 // download low speed time(seconds)
 DEFINE_mInt32(download_low_speed_time, "300");
 
-// log dir
-DEFINE_String(sys_log_dir, "${DORIS_HOME}/log");
+DEFINE_String(sys_log_dir, "");
 DEFINE_String(user_function_dir, "${DORIS_HOME}/lib/udf");
-DEFINE_String(pipeline_tracing_log_dir, "${DORIS_HOME}/log/tracing");
 // INFO, WARNING, ERROR, FATAL
 DEFINE_mString(sys_log_level, "INFO");
 // TIME-DAY, TIME-HOUR, SIZE-MB-nnn
@@ -237,6 +239,7 @@ DEFINE_Validator(doris_scanner_thread_pool_thread_num, [](const int config) -> b
     }
     return true;
 });
+DEFINE_Int32(remote_split_source_batch_size, "1024");
 DEFINE_Int32(doris_max_remote_scanner_thread_pool_thread_num, "-1");
 // number of olap scanner thread pool queue size
 DEFINE_Int32(doris_scanner_thread_pool_queue_size, "102400");
@@ -321,7 +324,7 @@ DEFINE_Int32(storage_page_cache_shard_size, "256");
 // all storage page cache will be divided into data_page_cache and index_page_cache
 DEFINE_Int32(index_page_cache_percentage, "10");
 // whether to disable page cache feature in storage
-DEFINE_Bool(disable_storage_page_cache, "false");
+DEFINE_mBool(disable_storage_page_cache, "false");
 // whether to disable row cache feature in storage
 DEFINE_mBool(disable_storage_row_cache, "true");
 // whether to disable pk page cache feature in storage
@@ -563,6 +566,9 @@ DEFINE_mInt32(memory_gc_sleep_time_ms, "1000");
 // Sleep time in milliseconds between memtbale flush mgr refresh iterations
 DEFINE_mInt64(memtable_mem_tracker_refresh_interval_ms, "5");
 
+// Sleep time in milliseconds between refresh iterations of workload group memory statistics
+DEFINE_mInt64(wg_mem_refresh_interval_ms, "50");
+
 // percent of (active memtables size / all memtables size) when reach hard limit
 DEFINE_mInt32(memtable_hard_limit_active_percent, "50");
 
@@ -598,7 +604,7 @@ DEFINE_mInt32(result_buffer_cancelled_interval_time, "300");
 DEFINE_mInt32(priority_queue_remaining_tasks_increased_frequency, "512");
 
 // sync tablet_meta when modifying meta
-DEFINE_mBool(sync_tablet_meta, "true");
+DEFINE_mBool(sync_tablet_meta, "false");
 
 // default thrift rpc timeout ms
 DEFINE_mInt32(thrift_rpc_timeout_ms, "60000");
@@ -612,9 +618,9 @@ DEFINE_Bool(enable_metric_calculator, "true");
 // max consumer num in one data consumer group, for routine load
 DEFINE_mInt32(max_consumer_num_per_group, "3");
 
-// the size of thread pool for routine load task.
+// the max size of thread pool for routine load task.
 // this should be larger than FE config 'max_routine_load_task_num_per_be' (default 5)
-DEFINE_Int32(routine_load_thread_pool_size, "10");
+DEFINE_Int32(max_routine_load_thread_pool_size, "1024");
 
 // max external scan cache batch count, means cache max_memory_cache_batch_count * batch_size row
 // default is 20, batch_size's default value is 1024 means 20 * 1024 rows will be cached
@@ -792,6 +798,11 @@ DEFINE_mInt32(jdbc_connection_pool_cache_clear_time_sec, "28800");
 
 // Global bitmap cache capacity for aggregation cache, size in bytes
 DEFINE_Int64(delete_bitmap_agg_cache_capacity, "104857600");
+// The default delete bitmap cache is set to 100MB,
+// which can be insufficient and cause performance issues when the amount of user data is large.
+// To mitigate the problem of an inadequate cache,
+// we will take the larger of 0.5% of the total memory and 100MB as the delete bitmap cache size.
+DEFINE_String(delete_bitmap_dynamic_agg_cache_limit, "0.5%");
 DEFINE_mInt32(delete_bitmap_agg_cache_stale_sweep_time_sec, "1800");
 
 // reference https://github.com/edenhill/librdkafka/blob/master/INTRODUCTION.md#broker-version-compatibility
@@ -806,7 +817,7 @@ DEFINE_String(kafka_debug, "disable");
 // The number of pool siz of routine load consumer.
 // If you meet the error describe in https://github.com/edenhill/librdkafka/issues/3608
 // Change this size to 0 to fix it temporarily.
-DEFINE_Int32(routine_load_consumer_pool_size, "10");
+DEFINE_mInt32(routine_load_consumer_pool_size, "1024");
 
 // Used in single-stream-multi-table load. When receive a batch of messages from kafka,
 // if the size of batch is more than this threshold, we will request plans for all related tables.
@@ -1031,6 +1042,10 @@ DEFINE_mInt32(schema_cache_sweep_time_sec, "100");
 
 // max number of segment cache, default -1 for backward compatibility fd_number*2/5
 DEFINE_mInt32(segment_cache_capacity, "-1");
+DEFINE_mInt32(estimated_num_columns_per_segment, "30");
+DEFINE_mInt32(estimated_mem_per_column_reader, "1024");
+// The value is calculate by storage_page_cache_limit * index_page_cache_percentage
+DEFINE_mInt32(segment_cache_memory_percentage, "2");
 
 // enable feature binlog, default false
 DEFINE_Bool(enable_feature_binlog, "false");
@@ -1048,6 +1063,7 @@ DEFINE_mBool(enable_delete_when_cumu_compaction, "false");
 // max_write_buffer_number for rocksdb
 DEFINE_Int32(rocksdb_max_write_buffer_number, "5");
 
+DEFINE_mBool(allow_zero_date, "false");
 DEFINE_Bool(allow_invalid_decimalv2_literal, "false");
 DEFINE_mString(kerberos_ccache_path, "");
 DEFINE_mString(kerberos_krb5_conf_path, "/etc/krb5.conf");
@@ -1116,6 +1132,8 @@ DEFINE_Bool(enable_flush_file_cache_async, "true");
 DEFINE_mString(doris_cgroup_cpu_path, "");
 DEFINE_mBool(enable_cgroup_cpu_soft_limit, "true");
 
+DEFINE_mBool(enable_workload_group_memory_gc, "true");
+
 DEFINE_Bool(ignore_always_true_predicate_for_segment, "true");
 
 // Dir of default timezone files
@@ -1154,18 +1172,26 @@ DEFINE_mDouble(high_disk_avail_level_diff_usages, "0.15");
 // create tablet in partition random robin idx lru size, default 10000
 DEFINE_Int32(partition_disk_index_lru_size, "10000");
 // limit the storage space that query spill files can use
-DEFINE_String(spill_storage_root_path, "${DORIS_HOME}/storage");
-DEFINE_mInt64(spill_storage_limit, "10737418240"); // 10G
-DEFINE_mInt32(spill_gc_interval_ms, "2000");       // 2s
-DEFINE_Int32(spill_io_thread_pool_per_disk_thread_num, "2");
-DEFINE_Int32(spill_io_thread_pool_queue_size, "1024");
-DEFINE_Int32(spill_async_task_thread_pool_thread_num, "2");
-DEFINE_Int32(spill_async_task_thread_pool_queue_size, "1024");
-DEFINE_mInt32(spill_mem_warning_water_mark_multiplier, "2");
+DEFINE_String(spill_storage_root_path, "");
+DEFINE_String(spill_storage_limit, "20%");    // 20%
+DEFINE_mInt32(spill_gc_interval_ms, "2000");  // 2s
+DEFINE_mInt32(spill_gc_work_time_ms, "2000"); // 2s
+DEFINE_Int32(spill_io_thread_pool_thread_num, "-1");
+DEFINE_Validator(spill_io_thread_pool_thread_num, [](const int config) -> bool {
+    if (config == -1) {
+        CpuInfo::init();
+        spill_io_thread_pool_thread_num = std::max(48, CpuInfo::num_cores() * 2);
+    }
+    return true;
+});
+DEFINE_Int32(spill_io_thread_pool_queue_size, "102400");
 
 DEFINE_mBool(check_segment_when_build_rowset_meta, "false");
 
 DEFINE_mInt32(max_s3_client_retry, "10");
+
+DEFINE_mInt32(s3_read_base_wait_time_ms, "100");
+DEFINE_mInt32(s3_read_max_wait_time_ms, "800");
 
 // ca_cert_file is in this path by default, Normally no modification is required
 // ca cert default path is different from different OS
@@ -1174,21 +1200,35 @@ DEFINE_mString(ca_cert_file_paths,
                "/etc/ssl/ca-bundle.pem");
 
 /** Table sink configurations(currently contains only external table types) **/
-// Minimum data processed to scale writers when non partition writing
+// Minimum data processed to scale writers in exchange when non partition writing
 DEFINE_mInt64(table_sink_non_partition_write_scaling_data_processed_threshold,
-              "125829120"); // 120MB
-// Minimum data processed to start rebalancing in exchange when partition writing
-DEFINE_mInt64(table_sink_partition_write_data_processed_threshold, "209715200"); // 200MB
+              "26214400"); // 25MB
 // Minimum data processed to trigger skewed partition rebalancing in exchange when partition writing
-DEFINE_mInt64(table_sink_partition_write_skewed_data_processed_rebalance_threshold,
-              "209715200"); // 200MB
+DEFINE_mInt64(table_sink_partition_write_min_data_processed_rebalance_threshold,
+              "26214400"); // 25MB
+// Minimum partition data processed to rebalance writers in exchange when partition writing
+DEFINE_mInt64(table_sink_partition_write_min_partition_data_processed_rebalance_threshold,
+              "15728640"); // 15MB
 // Maximum processed partition nums of per writer when partition writing
 DEFINE_mInt32(table_sink_partition_write_max_partition_nums_per_writer, "128");
 
 /** Hive sink configurations **/
 DEFINE_mInt64(hive_sink_max_file_size, "1073741824"); // 1GB
 
+/** Iceberg sink configurations **/
+DEFINE_mInt64(iceberg_sink_max_file_size, "1073741824"); // 1GB
+
 DEFINE_mInt32(thrift_client_open_num_tries, "1");
+
+DEFINE_mBool(ignore_schema_change_check, "false");
+
+//JVM monitoring enable. To prevent be from crashing due to jvm compatibility issues. The default setting is off.
+DEFINE_Bool(enable_jvm_monitor, "false");
+
+// Skip loading stale rowset meta when initializing `TabletMeta` from protobuf
+DEFINE_mBool(skip_loading_stale_rowset_meta, "false");
+
+DEFINE_Bool(enable_file_logger, "true");
 
 // clang-format off
 #ifdef BE_TEST
@@ -1657,11 +1697,18 @@ std::vector<std::vector<std::string>> get_config_info() {
         std::vector<std::string> _config;
         _config.push_back(it.first);
 
+        std::string config_val = it.second;
+        // For compatibility, this PR #32933 change the log dir's config logic,
+        // and deprecate the `sys_log_dir` config.
+        if (it.first == "sys_log_dir" && config_val == "") {
+            config_val = fmt::format("{}/log", std::getenv("DORIS_HOME"));
+        }
+
         _config.emplace_back(field_it->second.type);
         if (0 == strcmp(field_it->second.type, "bool")) {
-            _config.emplace_back(it.second == "1" ? "true" : "false");
+            _config.emplace_back(config_val == "1" ? "true" : "false");
         } else {
-            _config.push_back(it.second);
+            _config.push_back(config_val);
         }
         _config.emplace_back(field_it->second.valmutable ? "true" : "false");
 

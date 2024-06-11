@@ -61,6 +61,7 @@
 #include "olap/txn_manager.h"
 #include "olap/utils.h"
 #include "runtime/memory/mem_tracker_limiter.h"
+#include "runtime/thread_context.h"
 #include "util/time.h"
 #include "util/trace.h"
 
@@ -75,13 +76,19 @@ Compaction::Compaction(const TabletSharedPtr& tablet, const std::string& label)
           _input_row_num(0),
           _input_num_segments(0),
           _input_index_size(0),
-          _state(CompactionState::INITED),
-          _allow_delete_in_cumu_compaction(config::enable_delete_when_cumu_compaction) {
-    _mem_tracker = std::make_shared<MemTrackerLimiter>(MemTrackerLimiter::Type::COMPACTION, label);
+          _state(CompactionState::INITED) {
+    _mem_tracker = MemTrackerLimiter::create_shared(MemTrackerLimiter::Type::COMPACTION, label);
     init_profile(label);
 }
 
-Compaction::~Compaction() {}
+Compaction::~Compaction() {
+    SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(_mem_tracker);
+    _output_rs_writer.reset();
+    _tablet.reset();
+    _input_rowsets.clear();
+    _output_rowset.reset();
+    _cur_tablet_schema.reset();
+}
 
 void Compaction::init_profile(const std::string& label) {
     _profile = std::make_unique<RuntimeProfile>(label);
@@ -430,6 +437,7 @@ Status Compaction::do_compaction_impl(int64_t permits) {
         if (!allow_delete_in_cumu_compaction()) {
             missed_rows_size = missed_rows.size();
             if (compaction_type() == ReaderType::READER_CUMULATIVE_COMPACTION &&
+                _tablet->tablet_state() == TABLET_RUNNING &&
                 stats.merged_rows != missed_rows_size) {
                 std::string err_msg = fmt::format(
                         "cumulative compaction: the merged rows({}) is not equal to missed "
@@ -468,11 +476,9 @@ Status Compaction::do_compaction_impl(int64_t permits) {
             // src index files
             // format: rowsetId_segmentId
             std::vector<std::string> src_index_files(src_segment_num);
-            std::vector<RowsetId> src_rowset_ids;
             for (const auto& m : src_seg_to_id_map) {
                 std::pair<RowsetId, uint32_t> p = m.first;
                 src_index_files[m.second] = p.first.to_string() + "_" + std::to_string(p.second);
-                src_rowset_ids.push_back(p.first);
             }
 
             // dest index files
@@ -490,7 +496,7 @@ Status Compaction::do_compaction_impl(int64_t permits) {
                                               const std::string& file_name) {
                     io::FileWriterPtr file_writer;
                     std::string file_path =
-                            fmt::format("{}/{}.json", config::sys_log_dir, file_name);
+                            fmt::format("{}/{}.json", std::string(getenv("LOG_DIR")), file_name);
                     RETURN_IF_ERROR(
                             io::global_local_filesystem()->create_file(file_path, &file_writer));
                     RETURN_IF_ERROR(file_writer->append(json_obj.dump()));
@@ -615,9 +621,8 @@ Status Compaction::do_compaction_impl(int64_t permits) {
                 // if index properties are different, index compaction maybe needs to be skipped.
                 bool is_continue = false;
                 std::optional<std::map<std::string, std::string>> first_properties;
-                for (const auto& rowset_id : src_rowset_ids) {
-                    auto rowset_ptr = _tablet->get_rowset(rowset_id);
-                    const auto* tablet_index = rowset_ptr->tablet_schema()->get_inverted_index(col);
+                for (const auto& rowset : _input_rowsets) {
+                    const auto* tablet_index = rowset->tablet_schema()->get_inverted_index(col);
                     const auto& properties = tablet_index->properties();
                     if (!first_properties.has_value()) {
                         first_properties = properties;
@@ -904,15 +909,29 @@ Status Compaction::modify_rowsets(const Merger::Statistics* stats) {
                 &output_rowset_delete_bitmap);
         if (!allow_delete_in_cumu_compaction()) {
             missed_rows_size = missed_rows.size();
-            if (compaction_type() == ReaderType::READER_CUMULATIVE_COMPACTION && stats != nullptr &&
+            if (compaction_type() == ReaderType::READER_CUMULATIVE_COMPACTION &&
+                _tablet->tablet_state() == TABLET_RUNNING && stats != nullptr &&
                 stats->merged_rows != missed_rows_size) {
-                std::string err_msg = fmt::format(
-                        "cumulative compaction: the merged rows({}) is not equal to missed "
-                        "rows({}) in rowid conversion, tablet_id: {}, table_id:{}",
-                        stats->merged_rows, missed_rows_size, _tablet->tablet_id(),
-                        _tablet->table_id());
-                DCHECK(false) << err_msg;
-                LOG(WARNING) << err_msg;
+                std::stringstream ss;
+                ss << "cumulative compaction: the merged rows(" << stats->merged_rows
+                   << ") is not equal to missed rows(" << missed_rows_size
+                   << ") in rowid conversion, tablet_id: " << _tablet->tablet_id()
+                   << ", table_id:" << _tablet->table_id();
+                if (missed_rows_size == 0) {
+                    ss << ", debug info: ";
+                    DeleteBitmap subset_map(_tablet->tablet_id());
+                    for (auto rs : _input_rowsets) {
+                        _tablet->tablet_meta()->delete_bitmap().subset(
+                                {rs->rowset_id(), 0, 0},
+                                {rs->rowset_id(), rs->num_segments(), version.second + 1},
+                                &subset_map);
+                        ss << "(rowset id: " << rs->rowset_id()
+                           << ", delete bitmap cardinality: " << subset_map.cardinality() << ")";
+                    }
+                    ss << ", version[0-" << version.second + 1 << "]";
+                }
+                DCHECK(false) << ss.str();
+                LOG(WARNING) << ss.str();
             }
         }
 

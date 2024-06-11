@@ -38,6 +38,8 @@
 #include "olap/tablet_meta_manager.h"
 #include "olap/utils.h"
 #include "util/debug_points.h"
+#include "util/mem_info.h"
+#include "util/parse_util.h"
 #include "util/string_util.h"
 #include "util/time.h"
 #include "util/uid_util.h"
@@ -579,17 +581,10 @@ void TabletMeta::init_from_pb(const TabletMetaPB& tablet_meta_pb) {
         _rs_metas.push_back(std::move(rs_meta));
     }
 
-    // init _stale_rs_metas
-    for (auto& it : tablet_meta_pb.stale_rs_metas()) {
-        RowsetMetaSharedPtr rs_meta(new RowsetMeta());
-        rs_meta->init_from_pb(it);
-        _stale_rs_metas.push_back(std::move(rs_meta));
-    }
-
     // For mow table, delete bitmap of stale rowsets has not been persisted.
     // When be restart, query should not read the stale rowset, otherwise duplicate keys
     // will be read out. Therefore, we don't add them to _stale_rs_meta for mow table.
-    if (!_enable_unique_key_merge_on_write) {
+    if (!config::skip_loading_stale_rowset_meta && !_enable_unique_key_merge_on_write) {
         for (auto& it : tablet_meta_pb.stale_rs_metas()) {
             RowsetMetaSharedPtr rs_meta(new RowsetMeta());
             rs_meta->init_from_pb(it);
@@ -924,7 +919,18 @@ bool operator!=(const TabletMeta& a, const TabletMeta& b) {
 }
 
 DeleteBitmap::DeleteBitmap(int64_t tablet_id) : _tablet_id(tablet_id) {
-    _agg_cache.reset(new AggCache(config::delete_bitmap_agg_cache_capacity));
+    // The default delete bitmap cache is set to 100MB,
+    // which can be insufficient and cause performance issues when the amount of user data is large.
+    // To mitigate the problem of an inadequate cache,
+    // we will take the larger of 0.5% of the total memory and 100MB as the delete bitmap cache size.
+    bool is_percent = false;
+    int64_t delete_bitmap_agg_cache_cache_limit =
+            ParseUtil::parse_mem_spec(config::delete_bitmap_dynamic_agg_cache_limit,
+                                      MemInfo::mem_limit(), MemInfo::physical_mem(), &is_percent);
+    _agg_cache.reset(new AggCache(delete_bitmap_agg_cache_cache_limit >
+                                                  config::delete_bitmap_agg_cache_capacity
+                                          ? delete_bitmap_agg_cache_cache_limit
+                                          : config::delete_bitmap_agg_cache_capacity));
 }
 
 DeleteBitmap::DeleteBitmap(const DeleteBitmap& o) {
@@ -1005,6 +1011,14 @@ bool DeleteBitmap::contains_agg(const BitmapKey& bmk, uint32_t row_id) const {
 bool DeleteBitmap::empty() const {
     std::shared_lock l(lock);
     return delete_bitmap.empty();
+}
+
+uint64_t DeleteBitmap::cardinality() const {
+    uint64_t res = 0;
+    for (auto entry : delete_bitmap) {
+        res += entry.second.cardinality();
+    }
+    return res;
 }
 
 bool DeleteBitmap::contains_agg_without_cache(const BitmapKey& bmk, uint32_t row_id) const {

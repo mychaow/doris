@@ -39,7 +39,6 @@ import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.NamedExpression;
 import org.apache.doris.nereids.trees.expressions.Slot;
 import org.apache.doris.nereids.trees.expressions.SlotNotFromChildren;
-import org.apache.doris.nereids.trees.expressions.SlotReference;
 import org.apache.doris.nereids.trees.expressions.VirtualSlotReference;
 import org.apache.doris.nereids.trees.expressions.WhenClause;
 import org.apache.doris.nereids.trees.expressions.functions.agg.AggregateFunction;
@@ -74,11 +73,14 @@ import org.apache.doris.nereids.types.BigIntType;
 import org.apache.doris.nereids.types.DataType;
 import org.apache.doris.nereids.types.VarcharType;
 import org.apache.doris.nereids.util.ExpressionUtils;
+import org.apache.doris.nereids.util.Utils;
 import org.apache.doris.planner.PlanNode;
 
+import com.google.common.base.Suppliers;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 import com.google.common.collect.Streams;
@@ -164,7 +166,9 @@ public class SelectMaterializedIndexWithAggregate extends AbstractSelectMaterial
                             );
 
                             LogicalOlapScan mvPlan = createLogicalOlapScan(scan, result);
-                            SlotContext slotContext = generateBaseScanExprToMvExpr(mvPlan);
+                            SlotContext slotContext = generateBaseScanExprToMvExpr(mvPlan, requiredExpr.stream()
+                                    .map(e -> result.exprRewriteMap.replaceAgg(e)).collect(Collectors.toSet()),
+                                    filter.getConjuncts());
 
                             return new LogicalProject<>(
                                 generateProjectsAlias(agg.getOutputs(), slotContext),
@@ -203,22 +207,19 @@ public class SelectMaterializedIndexWithAggregate extends AbstractSelectMaterial
                             LogicalOlapScan mvPlan = createLogicalOlapScan(scan, result);
                             SlotContext slotContext = generateBaseScanExprToMvExpr(mvPlan);
 
-                            List<NamedExpression> newProjectList = replaceProjectList(project,
+                            List<NamedExpression> newProjectList = replaceOutput(project.getProjects(),
                                     result.exprRewriteMap.projectExprMap);
                             LogicalProject<LogicalOlapScan> newProject = new LogicalProject<>(
                                     generateNewOutputsWithMvOutputs(mvPlan, newProjectList),
-                                    scan.withMaterializedIndexSelected(result.preAggStatus, result.indexId));
-                            return new LogicalProject<>(
-                                generateProjectsAlias(agg.getOutputs(), slotContext),
-                                    new ReplaceExpressions(slotContext).replace(
-                                        new LogicalAggregate<>(
-                                            agg.getGroupByExpressions(),
-                                            replaceAggOutput(agg, Optional.of(project), Optional.of(newProject),
-                                                    result.exprRewriteMap),
-                                            agg.isNormalized(),
-                                            agg.getSourceRepeat(),
-                                            newProject
-                                        ), mvPlan));
+                                    scan.withMaterializedIndexSelected(result.indexId));
+                            return new LogicalProject<>(generateProjectsAlias(agg.getOutputs(), slotContext),
+                                    new ReplaceExpressions(slotContext)
+                                            .replace(
+                                                    new LogicalAggregate<>(agg.getGroupByExpressions(),
+                                                            replaceAggOutput(agg, Optional.of(project),
+                                                                    Optional.of(newProject), result.exprRewriteMap),
+                                                            agg.isNormalized(), agg.getSourceRepeat(), newProject),
+                                                    mvPlan));
                         }).toRule(RuleType.MATERIALIZED_INDEX_AGG_PROJECT_SCAN),
 
                 // filter could push down and project.
@@ -248,13 +249,16 @@ public class SelectMaterializedIndexWithAggregate extends AbstractSelectMaterial
                             );
 
                             LogicalOlapScan mvPlan = createLogicalOlapScan(scan, result);
-                            SlotContext slotContext = generateBaseScanExprToMvExpr(mvPlan);
+                            SlotContext slotContext = generateBaseScanExprToMvExpr(mvPlan, requiredExpr.stream()
+                                    .map(e -> result.exprRewriteMap.replaceAgg(e)).collect(Collectors.toSet()),
+                                    filter.getConjuncts());
                             if (result.indexId == scan.getTable().getBaseIndexId()) {
                                 LogicalOlapScan mvPlanWithoutAgg = SelectMaterializedIndexWithoutAggregate.select(scan,
                                         project::getInputSlots, filter::getConjuncts,
-                                        Stream.concat(filter.getExpressions().stream(),
-                                                project.getExpressions().stream())
-                                                .collect(ImmutableSet.toImmutableSet()));
+                                        Suppliers.memoize(() -> Utils.concatToSet(
+                                                filter.getExpressions(), project.getExpressions()
+                                        ))
+                                );
                                 SlotContext slotContextWithoutAgg = generateBaseScanExprToMvExpr(mvPlanWithoutAgg);
 
                                 return agg.withChildren(new LogicalProject(
@@ -264,7 +268,7 @@ public class SelectMaterializedIndexWithAggregate extends AbstractSelectMaterial
                                                 mvPlanWithoutAgg)));
                             }
 
-                            List<NamedExpression> newProjectList = replaceProjectList(project,
+                            List<NamedExpression> newProjectList = replaceOutput(project.getProjects(),
                                     result.exprRewriteMap.projectExprMap);
                             LogicalProject<Plan> newProject = new LogicalProject<>(
                                     generateNewOutputsWithMvOutputs(mvPlan, newProjectList),
@@ -308,9 +312,11 @@ public class SelectMaterializedIndexWithAggregate extends AbstractSelectMaterial
                             );
 
                             LogicalOlapScan mvPlan = createLogicalOlapScan(scan, result);
-                            SlotContext slotContext = generateBaseScanExprToMvExpr(mvPlan);
+                            SlotContext slotContext = generateBaseScanExprToMvExpr(mvPlan, requiredExpr.stream()
+                                    .map(e -> result.exprRewriteMap.replaceAgg(e)).collect(Collectors.toSet()),
+                                    filter.getConjuncts());
 
-                            List<NamedExpression> newProjectList = replaceProjectList(project,
+                            List<NamedExpression> newProjectList = replaceOutput(project.getProjects(),
                                     result.exprRewriteMap.projectExprMap);
                             LogicalProject<Plan> newProject = new LogicalProject<>(
                                     generateNewOutputsWithMvOutputs(mvPlan, newProjectList), mvPlan);
@@ -330,35 +336,31 @@ public class SelectMaterializedIndexWithAggregate extends AbstractSelectMaterial
 
                 // only agg above scan
                 // Aggregate(Repeat(Scan))
-                logicalAggregate(
-                    logicalRepeat(logicalOlapScan().when(this::shouldSelectIndexWithAgg))).thenApplyNoThrow(ctx -> {
-                        LogicalAggregate<LogicalRepeat<LogicalOlapScan>> agg = ctx.root;
-                        LogicalRepeat<LogicalOlapScan> repeat = agg.child();
-                        LogicalOlapScan scan = repeat.child();
-                        SelectResult result = select(
-                                scan,
-                                agg.getInputSlots(),
-                                ImmutableSet.of(),
-                                extractAggFunctionAndReplaceSlot(agg, Optional.empty()),
-                                nonVirtualGroupByExprs(agg),
-                                new HashSet<>(agg.getExpressions()));
+                logicalAggregate(logicalRepeat(logicalOlapScan().when(this::shouldSelectIndexWithAgg)))
+                        .thenApplyNoThrow(ctx -> {
+                            LogicalAggregate<LogicalRepeat<LogicalOlapScan>> agg = ctx.root;
+                            LogicalRepeat<LogicalOlapScan> repeat = agg.child();
+                            LogicalOlapScan scan = repeat.child();
+                            SelectResult result = select(scan, agg.getInputSlots(), ImmutableSet.of(),
+                                    extractAggFunctionAndReplaceSlot(agg, Optional.empty()),
+                                    nonVirtualGroupByExprs(agg), new HashSet<>(agg.getExpressions()));
 
-                        LogicalOlapScan mvPlan = createLogicalOlapScan(scan, result);
-                        SlotContext slotContext = generateBaseScanExprToMvExpr(mvPlan);
+                            LogicalOlapScan mvPlan = createLogicalOlapScan(scan, result);
+                            SlotContext slotContext = generateBaseScanExprToMvExpr(mvPlan);
 
-                        return new LogicalProject<>(
-                            generateProjectsAlias(agg.getOutputs(), slotContext),
-                                new ReplaceExpressions(slotContext).replace(
-                                    new LogicalAggregate<>(
-                                        agg.getGroupByExpressions(),
-                                        replaceAggOutput(
-                                            agg, Optional.empty(), Optional.empty(), result.exprRewriteMap),
-                                        agg.isNormalized(),
-                                        agg.getSourceRepeat(),
-                                        repeat.withAggOutputAndChild(
-                                            generateNewOutputsWithMvOutputs(mvPlan, repeat.getOutputs()), mvPlan)
-                                    ), mvPlan));
-                    }).toRule(RuleType.MATERIALIZED_INDEX_AGG_REPEAT_SCAN),
+                            return new LogicalProject<>(generateProjectsAlias(agg.getOutputs(), slotContext),
+                                    new ReplaceExpressions(slotContext)
+                                            .replace(
+                                                    new LogicalAggregate<>(agg.getGroupByExpressions(),
+                                                            replaceAggOutput(agg, Optional.empty(), Optional.empty(),
+                                                                    result.exprRewriteMap),
+                                                            agg.isNormalized(), agg.getSourceRepeat(),
+                                                            repeat.withAggOutputAndChild(
+                                                                    replaceOutput(repeat.getOutputs(),
+                                                                            result.exprRewriteMap.projectExprMap),
+                                                                    mvPlan)),
+                                                    mvPlan));
+                        }).toRule(RuleType.MATERIALIZED_INDEX_AGG_REPEAT_SCAN),
 
                 // filter could push down scan.
                 // Aggregate(Repeat(Filter(Scan)))
@@ -387,24 +389,24 @@ public class SelectMaterializedIndexWithAggregate extends AbstractSelectMaterial
                             );
 
                             LogicalOlapScan mvPlan = createLogicalOlapScan(scan, result);
-                            SlotContext slotContext = generateBaseScanExprToMvExpr(mvPlan);
+                            SlotContext slotContext = generateBaseScanExprToMvExpr(mvPlan, requiredExpr.stream()
+                                    .map(e -> result.exprRewriteMap.replaceAgg(e)).collect(Collectors.toSet()),
+                                    filter.getConjuncts());
 
-                            return new LogicalProject<>(
-                                generateProjectsAlias(agg.getOutputs(), slotContext),
-                                    new ReplaceExpressions(slotContext).replace(
-                                        new LogicalAggregate<>(
+                            return new LogicalProject<>(generateProjectsAlias(agg.getOutputs(), slotContext),
+                                    new ReplaceExpressions(slotContext).replace(new LogicalAggregate<>(
                                             agg.getGroupByExpressions(),
                                             replaceAggOutput(agg, Optional.empty(), Optional.empty(),
                                                     result.exprRewriteMap),
-                                            agg.isNormalized(),
-                                            agg.getSourceRepeat(),
+                                            agg.isNormalized(), agg.getSourceRepeat(),
                                             // Not that no need to replace slots in the filter,
                                             // because the slots to replace
                                             // are value columns, which shouldn't appear in filters.
                                             repeat.withAggOutputAndChild(
-                                                generateNewOutputsWithMvOutputs(mvPlan, repeat.getOutputs()),
-                                                filter.withChildren(mvPlan))
-                                        ), mvPlan));
+                                                    replaceOutput(repeat.getOutputs(),
+                                                            result.exprRewriteMap.projectExprMap),
+                                                    filter.withChildren(mvPlan))),
+                                            mvPlan));
                         }).toRule(RuleType.MATERIALIZED_INDEX_AGG_REPEAT_FILTER_SCAN),
 
                 // column pruning or other projections such as alias, etc.
@@ -429,24 +431,20 @@ public class SelectMaterializedIndexWithAggregate extends AbstractSelectMaterial
                             LogicalOlapScan mvPlan = createLogicalOlapScan(scan, result);
                             SlotContext slotContext = generateBaseScanExprToMvExpr(mvPlan);
 
-                            List<NamedExpression> newProjectList = replaceProjectList(project,
+                            List<NamedExpression> newProjectList = replaceOutput(project.getProjects(),
                                     result.exprRewriteMap.projectExprMap);
                             LogicalProject<LogicalOlapScan> newProject = new LogicalProject<>(
-                                    generateNewOutputsWithMvOutputs(mvPlan, newProjectList),
-                                    mvPlan);
-                            return new LogicalProject<>(
-                                generateProjectsAlias(agg.getOutputs(), slotContext),
+                                    generateNewOutputsWithMvOutputs(mvPlan, newProjectList), mvPlan);
+
+                            return new LogicalProject<>(generateProjectsAlias(agg.getOutputs(), slotContext),
                                     new ReplaceExpressions(slotContext).replace(
-                                        new LogicalAggregate<>(
-                                            agg.getGroupByExpressions(),
-                                            replaceAggOutput(agg, Optional.of(project), Optional.of(newProject),
-                                                    result.exprRewriteMap),
-                                            agg.isNormalized(),
-                                            agg.getSourceRepeat(),
-                                            repeat.withAggOutputAndChild(
-                                                generateNewOutputsWithMvOutputs(
-                                                    mvPlan, repeat.getOutputs()), newProject)
-                                        ), mvPlan));
+                                            new LogicalAggregate<>(agg.getGroupByExpressions(),
+                                                    replaceAggOutput(agg, Optional.of(project), Optional.of(newProject),
+                                                            result.exprRewriteMap),
+                                                    agg.isNormalized(), agg.getSourceRepeat(),
+                                                    repeat.withAggOutputAndChild(replaceOutput(repeat.getOutputs(),
+                                                            result.exprRewriteMap.projectExprMap), newProject)),
+                                            mvPlan));
                         }).toRule(RuleType.MATERIALIZED_INDEX_AGG_REPEAT_PROJECT_SCAN),
 
                 // filter could push down and project.
@@ -478,27 +476,25 @@ public class SelectMaterializedIndexWithAggregate extends AbstractSelectMaterial
                             );
 
                             LogicalOlapScan mvPlan = createLogicalOlapScan(scan, result);
-                            SlotContext slotContext = generateBaseScanExprToMvExpr(mvPlan);
+                            SlotContext slotContext = generateBaseScanExprToMvExpr(mvPlan, requiredExpr.stream()
+                                    .map(e -> result.exprRewriteMap.replaceAgg(e)).collect(Collectors.toSet()),
+                                    filter.getConjuncts());
 
-                            List<NamedExpression> newProjectList = replaceProjectList(project,
+                            List<NamedExpression> newProjectList = replaceOutput(project.getProjects(),
                                     result.exprRewriteMap.projectExprMap);
                             LogicalProject<Plan> newProject = new LogicalProject<>(
                                     generateNewOutputsWithMvOutputs(mvPlan, newProjectList),
                                     filter.withChildren(mvPlan));
 
-                            return new LogicalProject<>(
-                                generateProjectsAlias(agg.getOutputs(), slotContext),
+                            return new LogicalProject<>(generateProjectsAlias(agg.getOutputs(), slotContext),
                                     new ReplaceExpressions(slotContext).replace(
-                                        new LogicalAggregate<>(
-                                            agg.getGroupByExpressions(),
-                                            replaceAggOutput(agg, Optional.of(project), Optional.of(newProject),
-                                                    result.exprRewriteMap),
-                                            agg.isNormalized(),
-                                            agg.getSourceRepeat(),
-                                            repeat.withAggOutputAndChild(
-                                                generateNewOutputsWithMvOutputs(
-                                                    mvPlan, repeat.getOutputs()), newProject)
-                                    ), mvPlan));
+                                            new LogicalAggregate<>(agg.getGroupByExpressions(),
+                                                    replaceAggOutput(agg, Optional.of(project), Optional.of(newProject),
+                                                            result.exprRewriteMap),
+                                                    agg.isNormalized(), agg.getSourceRepeat(),
+                                                    repeat.withAggOutputAndChild(replaceOutput(repeat.getOutputs(),
+                                                            result.exprRewriteMap.projectExprMap), newProject)),
+                                            mvPlan));
                         }).toRule(RuleType.MATERIALIZED_INDEX_AGG_REPEAT_PROJECT_FILTER_SCAN),
 
                 // filter can't push down
@@ -528,42 +524,32 @@ public class SelectMaterializedIndexWithAggregate extends AbstractSelectMaterial
                             );
 
                             LogicalOlapScan mvPlan = createLogicalOlapScan(scan, result);
-                            SlotContext slotContext = generateBaseScanExprToMvExpr(mvPlan);
+                            SlotContext slotContext = generateBaseScanExprToMvExpr(mvPlan, requiredExpr.stream()
+                                    .map(e -> result.exprRewriteMap.replaceAgg(e)).collect(Collectors.toSet()),
+                                    filter.getConjuncts());
 
-                            List<NamedExpression> newProjectList = replaceProjectList(project,
+                            List<NamedExpression> newProjectList = replaceOutput(project.getProjects(),
                                     result.exprRewriteMap.projectExprMap);
                             LogicalProject<Plan> newProject = new LogicalProject<>(
                                     generateNewOutputsWithMvOutputs(mvPlan, newProjectList),
-                                    scan.withMaterializedIndexSelected(result.preAggStatus, result.indexId));
+                                    scan.withMaterializedIndexSelected(result.indexId));
 
-                            return new LogicalProject<>(
-                                generateProjectsAlias(agg.getOutputs(), slotContext),
-                                    new ReplaceExpressions(slotContext).replace(
-                                        new LogicalAggregate<>(
-                                            agg.getGroupByExpressions(),
-                                            replaceAggOutput(agg, Optional.of(project), Optional.of(newProject),
-                                                    result.exprRewriteMap),
-                                            agg.isNormalized(),
-                                            agg.getSourceRepeat(),
+                            return new LogicalProject<>(generateProjectsAlias(agg.getOutputs(), slotContext),
+                                    new ReplaceExpressions(slotContext).replace(new LogicalAggregate<>(
+                                            agg.getGroupByExpressions(), replaceAggOutput(agg, Optional.of(project),
+                                                    Optional.of(newProject), result.exprRewriteMap),
+                                            agg.isNormalized(), agg.getSourceRepeat(),
                                             repeat.withAggOutputAndChild(
-                                                generateNewOutputsWithMvOutputs(mvPlan, repeat.getOutputs()),
-                                                filter.withChildren(newProject))
-                                        ), mvPlan));
+                                                    replaceOutput(repeat.getOutputs(),
+                                                            result.exprRewriteMap.projectExprMap),
+                                                    filter.withChildren(newProject))),
+                                            mvPlan));
                         }).toRule(RuleType.MATERIALIZED_INDEX_AGG_REPEAT_FILTER_PROJECT_SCAN)
         );
     }
 
     private static LogicalOlapScan createLogicalOlapScan(LogicalOlapScan scan, SelectResult result) {
-        LogicalOlapScan mvPlan;
-        if (result.preAggStatus.isOff()) {
-            // we only set preAggStatus and make index unselected to let SelectMaterializedIndexWithoutAggregate
-            // have a chance to run and select proper index
-            mvPlan = scan.withPreAggStatus(result.preAggStatus);
-        } else {
-            mvPlan =
-                    scan.withMaterializedIndexSelected(result.preAggStatus, result.indexId);
-        }
-        return mvPlan;
+        return scan.withMaterializedIndexSelected(result.indexId);
     }
 
     ///////////////////////////////////////////////////////////////////////////
@@ -599,22 +585,22 @@ public class SelectMaterializedIndexWithAggregate extends AbstractSelectMaterial
                 .stream()
                 .collect(Collectors.groupingBy(index -> index.getId() == table.getBaseIndexId()));
 
-        Set<MaterializedIndex> candidatesWithoutRewriting = indexesGroupByIsBaseOrNot
-                .getOrDefault(false, ImmutableList.of()).stream()
-                .filter(index -> preAggEnabledByHint(scan)
-                        || checkPreAggStatus(scan, index.getId(), predicates, aggregateFunctions, groupingExprs).isOn())
-                .collect(Collectors.toSet());
-
         // try to rewrite bitmap, hll by materialized index columns.
-        List<AggRewriteResult> candidatesWithRewriting = indexesGroupByIsBaseOrNot
+        Set<AggRewriteResult> candidatesWithRewriting = indexesGroupByIsBaseOrNot
                 .getOrDefault(false, ImmutableList.of()).stream()
-                .filter(index -> !candidatesWithoutRewriting.contains(index))
                 .map(index -> rewriteAgg(index, scan, nonVirtualRequiredScanOutput, predicates, aggregateFunctions,
                         groupingExprs))
                 .filter(aggRewriteResult -> checkPreAggStatus(scan, aggRewriteResult.index.getId(), predicates,
                         // check pre-agg status of aggregate function that couldn't rewrite.
                         aggFuncsDiff(aggregateFunctions, aggRewriteResult), groupingExprs).isOn())
-                .collect(Collectors.toList());
+                .collect(Collectors.toSet());
+
+        Set<MaterializedIndex> candidatesWithoutRewriting = indexesGroupByIsBaseOrNot
+                .getOrDefault(false, ImmutableList.of()).stream()
+                .filter(index -> !candidatesWithRewriting.contains(index))
+                .filter(index -> preAggEnabledByHint(scan)
+                        || checkPreAggStatus(scan, index.getId(), predicates, aggregateFunctions, groupingExprs).isOn())
+                .collect(Collectors.toSet());
 
         List<MaterializedIndex> haveAllRequiredColumns = Streams.concat(
                 candidatesWithoutRewriting.stream()
@@ -688,7 +674,7 @@ public class SelectMaterializedIndexWithAggregate extends AbstractSelectMaterial
         Optional<Map<Slot, Expression>> slotToProducerOpt = project.map(Project::getAliasToProducer);
         return agg.getOutputExpressions().stream()
                 // extract aggregate functions.
-                .flatMap(e -> e.<Set<AggregateFunction>>collect(AggregateFunction.class::isInstance).stream())
+                .flatMap(e -> e.<AggregateFunction>collect(AggregateFunction.class::isInstance).stream())
                 // replace aggregate function's input slot by its producing expression.
                 .map(expr -> slotToProducerOpt.map(slotToExpressions
                                 -> (AggregateFunction) ExpressionUtils.replace(expr, slotToExpressions))
@@ -747,22 +733,22 @@ public class SelectMaterializedIndexWithAggregate extends AbstractSelectMaterial
 
         @Override
         public PreAggStatus visitAggregateFunction(AggregateFunction aggregateFunction, CheckContext context) {
-            return checkAggFunc(aggregateFunction, AggregateType.NONE, context);
+            return checkAggFunc(aggregateFunction, AggregateType.NONE, context, false);
         }
 
         @Override
         public PreAggStatus visitMax(Max max, CheckContext context) {
-            return checkAggFunc(max, AggregateType.MAX, context);
+            return checkAggFunc(max, AggregateType.MAX, context, true);
         }
 
         @Override
         public PreAggStatus visitMin(Min min, CheckContext context) {
-            return checkAggFunc(min, AggregateType.MIN, context);
+            return checkAggFunc(min, AggregateType.MIN, context, true);
         }
 
         @Override
         public PreAggStatus visitSum(Sum sum, CheckContext context) {
-            return checkAggFunc(sum, AggregateType.SUM, context);
+            return checkAggFunc(sum, AggregateType.SUM, context, false);
         }
 
         @Override
@@ -831,7 +817,8 @@ public class SelectMaterializedIndexWithAggregate extends AbstractSelectMaterial
         private PreAggStatus checkAggFunc(
                 AggregateFunction aggFunc,
                 AggregateType matchingAggType,
-                CheckContext ctx) {
+                CheckContext ctx,
+                boolean canUseKeyColumn) {
             String childNameWithFuncName = ctx.isBaseIndex()
                     ? normalizeName(aggFunc.child(0).toSql())
                     : normalizeName(CreateMaterializedViewStmt.mvColumnBuilder(
@@ -839,7 +826,7 @@ public class SelectMaterializedIndexWithAggregate extends AbstractSelectMaterial
 
             boolean contains = containsAllColumn(aggFunc.child(0), ctx.keyNameToColumn.keySet());
             if (contains || ctx.keyNameToColumn.containsKey(childNameWithFuncName)) {
-                if (ctx.isDupKeysOrMergeOnWrite || (!ctx.isBaseIndex() && contains)) {
+                if (canUseKeyColumn || ctx.isDupKeysOrMergeOnWrite || (!ctx.isBaseIndex() && contains)) {
                     return PreAggStatus.on();
                 } else {
                     Column column = ctx.keyNameToColumn.get(childNameWithFuncName);
@@ -1083,9 +1070,13 @@ public class SelectMaterializedIndexWithAggregate extends AbstractSelectMaterial
 
     private static class ExprRewriteMap {
         /**
-         * Replace map for expressions in project.
+         * Replace map for expressions in project. For example: the query have avg(v),
+         * stddev_samp(v) projectExprMap will contain v -> [mva_GENERIC__avg_state(`v`),
+         * mva_GENERIC__stddev_samp_state(CAST(`v` AS DOUBLE))] then some LogicalPlan
+         * will output [mva_GENERIC__avg_state(`v`),
+         * mva_GENERIC__stddev_samp_state(CAST(`v` AS DOUBLE))] to replace column v
          */
-        public final Map<Expression, Expression> projectExprMap;
+        public final Map<Expression, List<Expression>> projectExprMap;
         /**
          * Replace map for aggregate functions.
          */
@@ -1121,6 +1112,13 @@ public class SelectMaterializedIndexWithAggregate extends AbstractSelectMaterial
             }
             buildStrMap();
             return aggFuncStrMap.getOrDefault(e.toSql(), (AggregateFunction) e);
+        }
+
+        public void putIntoProjectExprMap(Expression key, Expression value) {
+            if (!projectExprMap.containsKey(key)) {
+                projectExprMap.put(key, Lists.newArrayList());
+            }
+            projectExprMap.get(key).add(value);
         }
     }
 
@@ -1197,7 +1195,7 @@ public class SelectMaterializedIndexWithAggregate extends AbstractSelectMaterial
                                 .orElseThrow(() -> new AnalysisException(
                                         "cannot find bitmap union slot when select mv"));
 
-                        context.exprRewriteMap.projectExprMap.put(slotOpt.get(), bitmapUnionSlot);
+                        context.exprRewriteMap.putIntoProjectExprMap(slotOpt.get(), bitmapUnionSlot);
                         BitmapUnionCount bitmapUnionCount = new BitmapUnionCount(bitmapUnionSlot);
                         context.exprRewriteMap.aggFuncMap.put(count, bitmapUnionCount);
                         return bitmapUnionCount;
@@ -1227,7 +1225,7 @@ public class SelectMaterializedIndexWithAggregate extends AbstractSelectMaterial
                             .filter(s -> countColumn.equalsIgnoreCase(normalizeName(s.getName()))).findFirst()
                             .orElseThrow(() -> new AnalysisException("cannot find count slot when select mv"));
 
-                    context.exprRewriteMap.projectExprMap.put(child, countSlot);
+                    context.exprRewriteMap.putIntoProjectExprMap(child, countSlot);
                     Sum sum = new Sum(countSlot);
                     context.exprRewriteMap.aggFuncMap.put(count, sum);
                     return sum;
@@ -1263,7 +1261,7 @@ public class SelectMaterializedIndexWithAggregate extends AbstractSelectMaterial
                                 .findFirst().orElseThrow(
                                         () -> new AnalysisException("cannot find bitmap union slot when select mv"));
 
-                        context.exprRewriteMap.projectExprMap.put(toBitmap, bitmapUnionSlot);
+                        context.exprRewriteMap.putIntoProjectExprMap(toBitmap, bitmapUnionSlot);
                         BitmapUnion newBitmapUnion = new BitmapUnion(bitmapUnionSlot);
                         context.exprRewriteMap.aggFuncMap.put(bitmapUnion, newBitmapUnion);
                         return newBitmapUnion;
@@ -1282,7 +1280,7 @@ public class SelectMaterializedIndexWithAggregate extends AbstractSelectMaterial
                             .stream().filter(s -> bitmapUnionColumn.equalsIgnoreCase(normalizeName(s.getName())))
                             .findFirst()
                             .orElseThrow(() -> new AnalysisException("cannot find bitmap union slot when select mv"));
-                    context.exprRewriteMap.projectExprMap.put(child, bitmapUnionSlot);
+                    context.exprRewriteMap.putIntoProjectExprMap(child, bitmapUnionSlot);
                     BitmapUnion newBitmapUnion = new BitmapUnion(bitmapUnionSlot);
                     context.exprRewriteMap.aggFuncMap.put(bitmapUnion, newBitmapUnion);
                     return newBitmapUnion;
@@ -1321,7 +1319,7 @@ public class SelectMaterializedIndexWithAggregate extends AbstractSelectMaterial
                                 .orElseThrow(() -> new AnalysisException(
                                         "cannot find bitmap union count slot when select mv"));
 
-                        context.exprRewriteMap.projectExprMap.put(toBitmap, bitmapUnionCountSlot);
+                        context.exprRewriteMap.putIntoProjectExprMap(toBitmap, bitmapUnionCountSlot);
                         BitmapUnionCount newBitmapUnionCount = new BitmapUnionCount(bitmapUnionCountSlot);
                         context.exprRewriteMap.aggFuncMap.put(bitmapUnionCount, newBitmapUnionCount);
                         return newBitmapUnionCount;
@@ -1340,7 +1338,7 @@ public class SelectMaterializedIndexWithAggregate extends AbstractSelectMaterial
                             .stream().filter(s -> bitmapUnionCountColumn.equalsIgnoreCase(normalizeName(s.getName())))
                             .findFirst().orElseThrow(
                                     () -> new AnalysisException("cannot find bitmap union count slot when select mv"));
-                    context.exprRewriteMap.projectExprMap.put(child, bitmapUnionCountSlot);
+                    context.exprRewriteMap.putIntoProjectExprMap(child, bitmapUnionCountSlot);
                     BitmapUnionCount newBitmapUnionCount = new BitmapUnionCount(bitmapUnionCountSlot);
                     context.exprRewriteMap.aggFuncMap.put(bitmapUnionCount, newBitmapUnionCount);
                     return newBitmapUnionCount;
@@ -1376,7 +1374,7 @@ public class SelectMaterializedIndexWithAggregate extends AbstractSelectMaterial
                                 .orElseThrow(() -> new AnalysisException(
                                         "cannot find hll union slot when select mv"));
 
-                        context.exprRewriteMap.projectExprMap.put(hllHash, hllUnionSlot);
+                        context.exprRewriteMap.putIntoProjectExprMap(hllHash, hllUnionSlot);
                         HllUnion newHllUnion = new HllUnion(hllUnionSlot);
                         context.exprRewriteMap.aggFuncMap.put(hllUnion, newHllUnion);
                         return newHllUnion;
@@ -1413,7 +1411,7 @@ public class SelectMaterializedIndexWithAggregate extends AbstractSelectMaterial
                                 .orElseThrow(() -> new AnalysisException(
                                         "cannot find hll union slot when select mv"));
 
-                        context.exprRewriteMap.projectExprMap.put(hllHash, hllUnionSlot);
+                        context.exprRewriteMap.putIntoProjectExprMap(hllHash, hllUnionSlot);
                         HllUnionAgg newHllUnionAgg = new HllUnionAgg(hllUnionSlot);
                         context.exprRewriteMap.aggFuncMap.put(hllUnionAgg, newHllUnionAgg);
                         return newHllUnionAgg;
@@ -1451,7 +1449,7 @@ public class SelectMaterializedIndexWithAggregate extends AbstractSelectMaterial
                             .orElseThrow(() -> new AnalysisException(
                                     "cannot find hll union slot when select mv"));
 
-                    context.exprRewriteMap.projectExprMap.put(slotOpt.get(), hllUnionSlot);
+                    context.exprRewriteMap.putIntoProjectExprMap(slotOpt.get(), hllUnionSlot);
                     HllUnionAgg hllUnionAgg = new HllUnionAgg(hllUnionSlot);
                     context.exprRewriteMap.aggFuncMap.put(ndv, hllUnionAgg);
                     return hllUnionAgg;
@@ -1475,7 +1473,7 @@ public class SelectMaterializedIndexWithAggregate extends AbstractSelectMaterial
                     Slot sumSlot = context.checkContext.scan.getOutputByIndex(context.checkContext.index).stream()
                             .filter(s -> sumColumn.equalsIgnoreCase(normalizeName(s.getName()))).findFirst()
                             .orElseThrow(() -> new AnalysisException("cannot find sum slot when select mv"));
-                    context.exprRewriteMap.projectExprMap.put(sum.child(), sumSlot);
+                    context.exprRewriteMap.putIntoProjectExprMap(sum.child(), sumSlot);
                     Sum newSum = new Sum(sumSlot);
                     context.exprRewriteMap.aggFuncMap.put(sum, newSum);
                     return newSum;
@@ -1499,9 +1497,8 @@ public class SelectMaterializedIndexWithAggregate extends AbstractSelectMaterial
                         .filter(s -> aggStateName.equalsIgnoreCase(normalizeName(s.getName()))).findFirst()
                         .orElseThrow(() -> new AnalysisException("cannot find agg state slot when select mv"));
 
-                Set<Slot> slots = aggregateFunction.collect(SlotReference.class::isInstance);
-                for (Slot slot : slots) {
-                    context.exprRewriteMap.projectExprMap.put(slot, aggStateSlot);
+                for (Expression child : aggregateFunction.children()) {
+                    context.exprRewriteMap.putIntoProjectExprMap(child, aggStateSlot);
                 }
 
                 MergeCombinator mergeCombinator = new MergeCombinator(Arrays.asList(aggStateSlot), aggregateFunction);
@@ -1572,12 +1569,29 @@ public class SelectMaterializedIndexWithAggregate extends AbstractSelectMaterial
         }
     }
 
-    private List<NamedExpression> replaceProjectList(
-            LogicalProject<? extends Plan> project,
-            Map<Expression, Expression> projectMap) {
-        return project.getProjects().stream()
-                .map(expr -> (NamedExpression) ExpressionUtils.replaceNameExpression(expr, projectMap))
-                .collect(Collectors.toList());
+    private List<NamedExpression> replaceOutput(List<NamedExpression> outputs,
+            Map<Expression, List<Expression>> projectMap) {
+        Map<String, List<Expression>> strToExprs = Maps.newHashMap();
+        for (Expression expr : projectMap.keySet()) {
+            strToExprs.put(expr.toSql(), projectMap.get(expr));
+        }
+
+        List<NamedExpression> results = Lists.newArrayList();
+        for (NamedExpression expr : outputs) {
+            results.add(expr);
+
+            if (!strToExprs.containsKey(expr.toSql())) {
+                continue;
+            }
+            for (Expression newExpr : strToExprs.get(expr.toSql())) {
+                if (newExpr instanceof NamedExpression) {
+                    results.add((NamedExpression) newExpr);
+                } else {
+                    results.add(new Alias(expr.getExprId(), newExpr, expr.getName()));
+                }
+            }
+        }
+        return results;
     }
 
     private List<Expression> nonVirtualGroupByExprs(LogicalAggregate<? extends Plan> agg) {

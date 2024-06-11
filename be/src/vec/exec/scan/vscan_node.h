@@ -94,10 +94,12 @@ public:
     VScannerSPtr _scanner;
     ScannerDelegate(VScannerSPtr& scanner_ptr) : _scanner(scanner_ptr) {}
     ~ScannerDelegate() {
+        SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(_scanner->runtime_state()->query_mem_tracker());
         Status st = _scanner->close(_scanner->runtime_state());
         if (!st.ok()) {
             LOG(WARNING) << "close scanner failed, st = " << st;
         }
+        _scanner.reset();
     }
     ScannerDelegate(ScannerDelegate&&) = delete;
 };
@@ -440,14 +442,20 @@ private:
                     eq_predicate_checker);
 
     template <PrimitiveType T>
-    Status _normalize_binary_in_compound_predicate(vectorized::VExpr* expr, VExprContext* expr_ctx,
-                                                   SlotDescriptor* slot, ColumnValueRange<T>& range,
-                                                   PushDownType* pdt);
+    Status _normalize_binary_compound_predicate(vectorized::VExpr* expr, VExprContext* expr_ctx,
+                                                SlotDescriptor* slot, ColumnValueRange<T>& range,
+                                                PushDownType* pdt);
 
     template <PrimitiveType T>
-    Status _normalize_match_in_compound_predicate(vectorized::VExpr* expr, VExprContext* expr_ctx,
-                                                  SlotDescriptor* slot, ColumnValueRange<T>& range,
-                                                  PushDownType* pdt);
+    Status _normalize_in_and_not_in_compound_predicate(vectorized::VExpr* expr,
+                                                       VExprContext* expr_ctx, SlotDescriptor* slot,
+                                                       ColumnValueRange<T>& range,
+                                                       PushDownType* pdt);
+
+    template <PrimitiveType T>
+    Status _normalize_match_compound_predicate(vectorized::VExpr* expr, VExprContext* expr_ctx,
+                                               SlotDescriptor* slot, ColumnValueRange<T>& range,
+                                               PushDownType* pdt);
 
     template <PrimitiveType T>
     Status _normalize_is_null_predicate(vectorized::VExpr* expr, VExprContext* expr_ctx,

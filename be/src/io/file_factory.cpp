@@ -67,7 +67,8 @@ Status FileFactory::create_file_writer(TFileType::type type, ExecEnv* env,
                                        const std::vector<TNetworkAddress>& broker_addresses,
                                        const std::map<std::string, std::string>& properties,
                                        const std::string& path, int64_t start_offset,
-                                       std::unique_ptr<io::FileWriter>& file_writer) {
+                                       std::unique_ptr<io::FileWriter>& file_writer,
+                                       const io::FileWriterOptions* opts) {
     switch (type) {
     case TFileType::FILE_LOCAL: {
         RETURN_IF_ERROR(io::global_local_filesystem()->create_file(path, &file_writer));
@@ -76,7 +77,7 @@ Status FileFactory::create_file_writer(TFileType::type type, ExecEnv* env,
     case TFileType::FILE_BROKER: {
         std::shared_ptr<io::BrokerFileSystem> fs;
         RETURN_IF_ERROR(io::BrokerFileSystem::create(broker_addresses[0], properties, &fs));
-        RETURN_IF_ERROR(fs->create_file(path, &file_writer));
+        RETURN_IF_ERROR(fs->create_file(path, &file_writer, opts));
         break;
     }
     case TFileType::FILE_S3: {
@@ -86,16 +87,29 @@ Status FileFactory::create_file_writer(TFileType::type type, ExecEnv* env,
         RETURN_IF_ERROR(
                 S3ClientFactory::convert_properties_to_s3_conf(properties, s3_uri, &s3_conf));
         std::shared_ptr<io::S3FileSystem> fs;
-        RETURN_IF_ERROR(io::S3FileSystem::create(s3_conf, "", &fs));
-        RETURN_IF_ERROR(fs->create_file(path, &file_writer));
+        RETURN_IF_ERROR(io::S3FileSystem::create(s3_conf, "", nullptr, &fs));
+        RETURN_IF_ERROR(fs->create_file(path, &file_writer, opts));
         break;
     }
     case TFileType::FILE_HDFS: {
         THdfsParams hdfs_params = parse_properties(properties);
         std::shared_ptr<io::HdfsFileSystem> fs;
+        // If the destination path contains a schema, use the schema directly.
+        // If not, use defaultFS.
+        // Otherwise a write error will occur.
+        // example:
+        //    hdfs://host:port/path1/path2  --> hdfs://host:port
+        //    hdfs://nameservice/path1/path2 --> hdfs://nameservice
+        string::size_type idx = path.find("://");
+        if (idx != string::npos) {
+            idx = path.find("/", idx + 3);
+            if (idx != string::npos) {
+                hdfs_params.fs_name = path.substr(0, idx);
+            }
+        }
         RETURN_IF_ERROR(
                 io::HdfsFileSystem::create(hdfs_params, "", hdfs_params.fs_name, nullptr, &fs));
-        RETURN_IF_ERROR(fs->create_file(path, &file_writer));
+        RETURN_IF_ERROR(fs->create_file(path, &file_writer, opts));
         break;
     }
     default:
@@ -120,7 +134,7 @@ Status FileFactory::create_file_reader(const io::FileSystemProperties& system_pr
     }
     case TFileType::FILE_S3: {
         RETURN_IF_ERROR(create_s3_reader(system_properties.properties, file_description,
-                                         reader_options, file_system, file_reader));
+                                         reader_options, file_system, file_reader, profile));
         break;
     }
     case TFileType::FILE_HDFS: {
@@ -199,13 +213,13 @@ Status FileFactory::create_s3_reader(const std::map<std::string, std::string>& p
                                      const io::FileDescription& fd,
                                      const io::FileReaderOptions& reader_options,
                                      std::shared_ptr<io::FileSystem>* s3_file_system,
-                                     io::FileReaderSPtr* reader) {
+                                     io::FileReaderSPtr* reader, RuntimeProfile* profile) {
     S3URI s3_uri(fd.path);
     RETURN_IF_ERROR(s3_uri.parse());
     S3Conf s3_conf;
     RETURN_IF_ERROR(S3ClientFactory::convert_properties_to_s3_conf(prop, s3_uri, &s3_conf));
     std::shared_ptr<io::S3FileSystem> fs;
-    RETURN_IF_ERROR(io::S3FileSystem::create(std::move(s3_conf), "", &fs));
+    RETURN_IF_ERROR(io::S3FileSystem::create(std::move(s3_conf), "", profile, &fs));
     RETURN_IF_ERROR(fs->open_file(fd.path, reader, &reader_options));
     *s3_file_system = std::move(fs);
     return Status::OK();
